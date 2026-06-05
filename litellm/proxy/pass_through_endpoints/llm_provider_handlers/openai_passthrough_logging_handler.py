@@ -1,9 +1,4 @@
-"""
-OpenAI Passthrough Logging Handler
-
-Handles cost tracking and logging for OpenAI passthrough endpoints, specifically /chat/completions.
-"""
-
+import re
 from datetime import datetime
 from typing import List, Optional, Union
 from urllib.parse import urlparse
@@ -21,6 +16,8 @@ from litellm.llms.openai.openai import OpenAIConfig as OpenAIConfigType
 from litellm.proxy._types import PassThroughEndpointLoggingTypedDict
 from litellm.proxy.pass_through_endpoints.llm_provider_handlers.base_passthrough_logging_handler import (
     BasePassthroughLoggingHandler,
+    get_actual_model_id_from_router,
+    store_batch_managed_object,
 )
 from litellm.proxy.pass_through_endpoints.success_handler import (
     PassThroughEndpointLogging,
@@ -29,7 +26,12 @@ from litellm.types.passthrough_endpoints.pass_through_endpoints import (
     EndpointType,
     PassthroughStandardLoggingPayload,
 )
-from litellm.types.utils import ImageResponse, LlmProviders, PassthroughCallTypes
+from litellm.types.utils import (
+    ImageResponse,
+    LiteLLMBatch,
+    LlmProviders,
+    PassthroughCallTypes,
+)
 from litellm.utils import ModelResponse, TextCompletionResponse
 
 
@@ -106,11 +108,145 @@ class OpenAIPassthroughLoggingHandler(BasePassthroughLoggingHandler):
             and ("/v1/responses" in parsed_url.path or "/responses" in parsed_url.path)
         )
 
+    @staticmethod
+    def is_openai_batch_route(url_route: str, method: str = "POST") -> bool:
+        if not url_route or method.upper() != "POST":
+            return False
+        parsed_url = urlparse(url_route)
+        if not parsed_url.hostname:
+            return False
+        is_openai = "api.openai.com" in parsed_url.hostname
+        is_azure = "openai.azure.com" in parsed_url.hostname
+        if not (is_openai or is_azure):
+            return False
+        path = parsed_url.path
+        return bool(
+            re.search(r"/v1/batches$", path)
+            or (is_azure and re.search(r"/deployments/[^/]+/batches$", path))
+        )
+
+    @staticmethod
+    def _extract_model_from_batch_url(url_route: str, custom_llm_provider: str) -> str:
+        parsed_url = urlparse(url_route)
+        if "openai.azure.com" in (parsed_url.hostname or ""):
+            match = re.search(r"/deployments/([^/]+)/batches", parsed_url.path)
+            if match:
+                return f"azure/{match.group(1)}"
+        return "openai"
+
+    @staticmethod
+    def batch_creation_handler(
+        httpx_response: httpx.Response,
+        logging_obj: LiteLLMLoggingObj,
+        url_route: str,
+        start_time: datetime,
+        request_body: dict,
+        **kwargs,
+    ) -> PassThroughEndpointLoggingTypedDict:
+        from litellm._uuid import uuid
+        from litellm.types.utils import Choices, SpecialEnums
+
+        try:
+            _json_response = httpx_response.json()
+            if httpx_response.status_code != 200 or "id" not in _json_response:
+                return {"result": None, "kwargs": {**kwargs, "response_cost": 0.0}}
+
+            batch_id = _json_response["id"]
+            custom_llm_provider = kwargs.get("custom_llm_provider", "openai")
+            raw_model = OpenAIPassthroughLoggingHandler._extract_model_from_batch_url(
+                url_route, custom_llm_provider
+            )
+            actual_model_id = get_actual_model_id_from_router(raw_model)
+
+            import base64
+
+            unified_id_string = (
+                SpecialEnums.LITELLM_MANAGED_BATCH_COMPLETE_STR.value.format(
+                    actual_model_id, batch_id
+                )
+            )
+            unified_object_id = (
+                base64.urlsafe_b64encode(unified_id_string.encode())
+                .decode()
+                .rstrip("=")
+            )
+
+            litellm_batch_response = LiteLLMBatch(
+                id=batch_id,
+                object="batch",
+                endpoint=_json_response.get("endpoint", "/v1/chat/completions"),
+                input_file_id=_json_response.get("input_file_id", ""),
+                completion_window=_json_response.get("completion_window", "24h"),
+                status="validating",
+                output_file_id=_json_response.get("output_file_id"),
+                error_file_id=_json_response.get("error_file_id"),
+                created_at=_json_response.get(
+                    "created_at", int(start_time.timestamp())
+                ),
+                expires_at=_json_response.get("expires_at"),
+                in_progress_at=_json_response.get("in_progress_at"),
+                finalizing_at=_json_response.get("finalizing_at"),
+                completed_at=_json_response.get("completed_at"),
+                failed_at=_json_response.get("failed_at"),
+                expired_at=_json_response.get("expired_at"),
+                cancelling_at=_json_response.get("cancelling_at"),
+                cancelled_at=_json_response.get("cancelled_at"),
+                request_counts=_json_response.get("request_counts"),
+                metadata=_json_response.get("metadata"),
+            )
+
+            store_batch_managed_object(
+                unified_object_id=unified_object_id,
+                batch_object=litellm_batch_response,
+                model_object_id=batch_id,
+                logging_obj=logging_obj,
+                **kwargs,
+            )
+
+            litellm_model_response = ModelResponse()
+            litellm_model_response.id = str(uuid.uuid4())
+            litellm_model_response.model = actual_model_id
+            litellm_model_response.object = "batch"
+            litellm_model_response.created = int(start_time.timestamp())
+            litellm_model_response.choices = [
+                Choices(
+                    finish_reason="stop",
+                    index=0,
+                    message={
+                        "role": "assistant",
+                        "content": f"Batch job {batch_id} created and is pending.",
+                        "tool_calls": None,
+                        "function_call": None,
+                        "provider_specific_fields": {
+                            "batch_job_id": batch_id,
+                            "batch_job_state": "in_progress",
+                            "unified_object_id": unified_object_id,
+                        },
+                    },
+                )
+            ]
+
+            kwargs["response_cost"] = 0.0
+            kwargs["model"] = actual_model_id
+            kwargs["batch_id"] = batch_id
+            kwargs["unified_object_id"] = unified_object_id
+            kwargs["batch_job_state"] = "in_progress"
+
+            logging_obj.model = actual_model_id
+            logging_obj.model_call_details["model"] = actual_model_id
+            logging_obj.model_call_details["response_cost"] = 0.0
+            logging_obj.model_call_details["batch_id"] = batch_id
+
+            return {"result": litellm_model_response, "kwargs": kwargs}
+
+        except Exception as e:
+            verbose_proxy_logger.error(f"Error in OpenAI batch_creation_handler: {e}")
+            return {"result": None, "kwargs": {**kwargs, "response_cost": 0.0}}
+
     def _get_user_from_metadata(
         self,
         passthrough_logging_payload: PassthroughStandardLoggingPayload,
     ) -> Optional[str]:
-        """Extract user information from passthrough logging payload."""
         request_body = passthrough_logging_payload.get("request_body")
         if request_body:
             return request_body.get("user")
@@ -204,7 +340,21 @@ class OpenAIPassthroughLoggingHandler(BasePassthroughLoggingHandler):
         """
         Handle OpenAI passthrough logging with cost tracking for chat completions, image generation, image editing, and responses API.
         """
-        # Check if this is a supported endpoint for cost tracking
+        request_method = (
+            httpx_response.request.method if httpx_response.request else "POST"
+        )
+        if OpenAIPassthroughLoggingHandler.is_openai_batch_route(
+            url_route, method=request_method
+        ):
+            return OpenAIPassthroughLoggingHandler.batch_creation_handler(
+                httpx_response=httpx_response,
+                logging_obj=logging_obj,
+                url_route=url_route,
+                start_time=start_time,
+                request_body=request_body,
+                **kwargs,
+            )
+
         is_chat_completions = (
             OpenAIPassthroughLoggingHandler.is_openai_chat_completions_route(url_route)
         )
@@ -224,7 +374,6 @@ class OpenAIPassthroughLoggingHandler(BasePassthroughLoggingHandler):
             or is_image_editing
             or is_responses
         ):
-            # For unsupported endpoints, return None to let the system fall back to generic behavior
             return {
                 "result": None,
                 "kwargs": kwargs,
