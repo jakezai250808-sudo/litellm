@@ -438,9 +438,15 @@ class PassThroughEndpointLogging:
         if not url_route:
             return False
         parsed_url = urlparse(url_route)
-        return parsed_url.hostname and (
-            "api.openai.com" in parsed_url.hostname
-            or "openai.azure.com" in parsed_url.hostname
+        from .llm_provider_handlers.openai_passthrough_logging_handler import (
+            OpenAIPassthroughLoggingHandler,
+        )
+
+        return bool(
+            parsed_url.hostname
+            and OpenAIPassthroughLoggingHandler._is_openai_compatible_hostname(
+                parsed_url.hostname
+            )
         )
 
     def is_gemini_route(
