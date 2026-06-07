@@ -3088,6 +3088,32 @@ class BaseLLMHTTPHandler:
             litellm_params=litellm_params,
         )
 
+        # Extract file data once to avoid re-reading non-seekable streams
+        from litellm.litellm_core_utils.prompt_templates.common_utils import (
+            extract_file_data,
+        )
+
+        file_data = create_file_data.get("file")
+        if file_data is not None:
+            extracted = extract_file_data(file_data)
+            extracted_content = extracted.get("content")
+            if extracted_content is not None:
+                # Replace the file handle with extracted bytes to prevent
+                # re-reading non-seekable streams in subsequent operations
+                if isinstance(file_data, tuple):
+                    # Preserve tuple structure but replace content with bytes
+                    new_file_data = (
+                        extracted.get("filename")
+                        or (file_data[0] if len(file_data) > 0 else None),
+                        extracted_content,
+                    )
+                    if len(file_data) > 2:
+                        new_file_data = new_file_data + file_data[2:]
+                    create_file_data = {**create_file_data, "file": new_file_data}
+                else:
+                    # Replace with just the bytes
+                    create_file_data = {**create_file_data, "file": extracted_content}
+
         api_base = provider_config.get_complete_file_url(
             api_base=api_base,
             api_key=api_key,

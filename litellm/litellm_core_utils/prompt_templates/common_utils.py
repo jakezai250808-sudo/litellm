@@ -788,7 +788,10 @@ def extract_file_data(file_data: FileTypes) -> ExtractedFileData:
         if isinstance(content, str):
             content = content.encode("utf-8")
         # Reset file pointer to beginning
-        file_content.seek(0)
+        try:
+            file_content.seek(0)
+        except (OSError, io.UnsupportedOperation):
+            pass
     elif isinstance(file_content, bytes):
         content = file_content
     else:
