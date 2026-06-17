@@ -85,7 +85,13 @@ class GooglePSESearchConfig(BaseSearchConfig):
         Google PSE uses API key as a query parameter, not in headers.
         This method is called but headers are not used for authentication.
         """
-        api_key = api_key or get_secret_str("GOOGLE_PSE_API_KEY")
+        api_key = self.resolve_server_api_key(
+            caller_api_key=api_key,
+            caller_api_base=api_base,
+            key_env_vars=("GOOGLE_PSE_API_KEY",),
+            base_env_var="GOOGLE_PSE_API_BASE",
+            default_api_base=self.GOOGLE_PSE_API_BASE,
+        )
         if not api_key:
             raise ValueError(
                 "GOOGLE_PSE_API_KEY is not set. Set `GOOGLE_PSE_API_KEY` environment variable."

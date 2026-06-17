@@ -74,7 +74,13 @@ class SearchAPIConfig(BaseSearchConfig):
         """
         Validate environment and return headers.
         """
-        api_key = api_key or get_secret_str("SEARCHAPI_API_KEY")
+        api_key = self.resolve_server_api_key(
+            caller_api_key=api_key,
+            caller_api_base=api_base,
+            key_env_vars=("SEARCHAPI_API_KEY",),
+            base_env_var="SEARCHAPI_API_BASE",
+            default_api_base=self.SEARCHAPI_API_BASE,
+        )
 
         if not api_key:
             raise ValueError(
