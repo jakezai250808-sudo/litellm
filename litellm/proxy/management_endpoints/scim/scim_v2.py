@@ -244,6 +244,86 @@ async def _get_scim_upsert_user_setting() -> bool:
         return True
 
 
+ScimUserRole = Literal[
+    LitellmUserRoles.PROXY_ADMIN,
+    LitellmUserRoles.PROXY_ADMIN_VIEW_ONLY,
+    LitellmUserRoles.INTERNAL_USER,
+    LitellmUserRoles.INTERNAL_USER_VIEW_ONLY,
+]
+
+
+def _default_scim_user_role() -> ScimUserRole:
+    """Non-admin default role for SCIM-provisioned users."""
+    if litellm.default_internal_user_params:
+        configured_role = litellm.default_internal_user_params.get("user_role")
+        if configured_role is not None:
+            return configured_role
+    return LitellmUserRoles.INTERNAL_USER_VIEW_ONLY
+
+
+async def _get_scim_admin_group() -> Optional[str]:
+    """
+    Get the scim_admin_group setting from litellm_settings.
+
+    Returns the configured admin group identifier, or None when unset so callers
+    leave a user's global role untouched (default-safe).
+    """
+    try:
+        from litellm.proxy.proxy_server import proxy_config
+
+        config = await proxy_config.get_config()
+        litellm_settings = config.get("litellm_settings", {}) or {}
+        return litellm_settings.get("scim_admin_group") or None
+    except Exception as e:
+        verbose_proxy_logger.warning(
+            f"Error reading scim_admin_group setting, defaulting to None: {e}"
+        )
+        return None
+
+
+def _resolve_scim_user_role(
+    groups: List[SCIMUserGroup],
+    admin_group: Optional[str],
+    default_role: ScimUserRole,
+) -> Optional[LitellmUserRoles]:
+    """
+    Resolve a user's global proxy role from their SCIM groups.
+
+    Returns None when no admin group is configured, signalling callers to leave
+    the role unchanged. Otherwise grants PROXY_ADMIN when any group matches the
+    admin group by value or display, and falls back to the non-admin default.
+    """
+    if admin_group is None:
+        return None
+    for group in groups:
+        if group.value == admin_group or group.display == admin_group:
+            return LitellmUserRoles.PROXY_ADMIN
+    return default_role
+
+
+async def _scim_groups_from_team_ids(
+    prisma_client: Any, team_ids: List[str]
+) -> List[SCIMUserGroup]:
+    """
+    Build SCIMUserGroup objects from team ids, populating display from each
+    team's alias so admin-group matching by display name works the same way it
+    does on PUT (where SCIM groups carry display names natively).
+    """
+    teams = [
+        await TeamRepository(prisma_client).table.find_unique(
+            where={"team_id": team_id}
+        )
+        for team_id in team_ids
+    ]
+    return [
+        SCIMUserGroup(
+            value=team_id,
+            display=team.team_alias if team is not None else None,
+        )
+        for team_id, team in zip(team_ids, teams)
+    ]
+
+
 async def _extract_group_member_ids(group: SCIMGroup) -> GroupMemberExtractionResult:
     """
     Extract member IDs from SCIMGroup, validating that all users exist.
@@ -1002,16 +1082,11 @@ async def create_user(
             user_data["given_name"], user_data["family_name"]
         )
 
-        default_role: Optional[
-            Literal[
-                LitellmUserRoles.PROXY_ADMIN,
-                LitellmUserRoles.PROXY_ADMIN_VIEW_ONLY,
-                LitellmUserRoles.INTERNAL_USER,
-                LitellmUserRoles.INTERNAL_USER_VIEW_ONLY,
-            ]
-        ] = LitellmUserRoles.INTERNAL_USER_VIEW_ONLY
-        if litellm.default_internal_user_params:
-            default_role = litellm.default_internal_user_params.get("user_role")
+        default_role = _default_scim_user_role()
+        admin_group = await _get_scim_admin_group()
+        resolved_role = _resolve_scim_user_role(
+            user.groups or [], admin_group, default_role
+        )
 
         new_user_request = NewUserRequest(
             user_id=user_id,
@@ -1020,7 +1095,7 @@ async def create_user(
             teams=user_data["teams"],
             metadata=metadata,
             auto_create_key=False,
-            user_role=default_role,
+            user_role=resolved_role if admin_group is not None else default_role,
         )
 
         # Check if user with email already exists and update if found
@@ -1103,6 +1178,12 @@ async def update_user(
             "teams": user_data["teams"],
             "metadata": safe_dumps(metadata),
         }
+
+        admin_group = await _get_scim_admin_group()
+        if admin_group is not None:
+            update_data["user_role"] = _resolve_scim_user_role(
+                user.groups or [], admin_group, _default_scim_user_role()
+            )
 
         updated_user = await UserRepository(prisma_client).table.update(
             where={"user_id": user_id},
@@ -1416,6 +1497,14 @@ async def patch_user(
         )
 
         update_data["teams"] = list(final_team_set)
+
+        admin_group = await _get_scim_admin_group()
+        if admin_group is not None:
+            update_data["user_role"] = _resolve_scim_user_role(
+                await _scim_groups_from_team_ids(prisma_client, list(final_team_set)),
+                admin_group,
+                _default_scim_user_role(),
+            )
 
         # Serialize metadata to JSON string for Prisma to avoid GraphQL parsing issues
         if "metadata" in update_data and isinstance(update_data["metadata"], dict):
