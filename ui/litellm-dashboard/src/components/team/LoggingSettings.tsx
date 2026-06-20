@@ -7,6 +7,7 @@ import { Button, Card, TextInput } from "@tremor/react";
 import { PlusIcon, TrashIcon, CogIcon, BanIcon } from "@heroicons/react/outline";
 import { callbackInfo, callback_map, mapDisplayToInternalNames } from "../callback_info_helpers";
 import NumericalInput from "../shared/numerical_input";
+import { useCredentials } from "@/app/(dashboard)/hooks/credentials/useCredentials";
 
 const { Option } = Select;
 
@@ -29,6 +30,14 @@ const LoggingSettings: React.FC<LoggingSettingsProps> = ({
   disabledCallbacks = [],
   onDisabledCallbacksChange,
 }) => {
+  // Named logging destinations the admin can bind (host + keys live in the registry,
+  // never in the request). Filtered to credential_type=logging so the picker shows
+  // trace destinations only, never provider api-keys.
+  const { data: credentialsResponse } = useCredentials();
+  const credentialNames = (credentialsResponse?.credentials ?? [])
+    .filter((credential) => credential.credential_info?.credential_type === "logging")
+    .map((credential) => credential.credential_name);
+
   // Get callbacks that support team and key logging
   const supportedCallbacks = Object.entries(callbackInfo)
     .filter(([_, info]) => info.supports_key_team_logging)
@@ -117,9 +126,11 @@ const LoggingSettings: React.FC<LoggingSettingsProps> = ({
             <div key={paramName} className="space-y-2">
               <label className="text-sm font-medium text-gray-700 capitalize flex items-center space-x-1">
                 <span>{paramName.replace(/_/g, " ")}</span>
-                <Tooltip title={`Environment variable reference recommended: os.environ/${paramName.toUpperCase()}`}>
-                  <InfoCircleOutlined className="text-gray-400 cursor-help text-xs" />
-                </Tooltip>
+                {paramType !== "credential" && (
+                  <Tooltip title={`Environment variable reference recommended: os.environ/${paramName.toUpperCase()}`}>
+                    <InfoCircleOutlined className="text-gray-400 cursor-help text-xs" />
+                  </Tooltip>
+                )}
                 {paramType === "password" && (
                   <span className="inline-flex items-center px-2 py-0.5 rounded text-xs font-medium bg-yellow-100 text-yellow-800">
                     Sensitive
@@ -132,7 +143,23 @@ const LoggingSettings: React.FC<LoggingSettingsProps> = ({
                 )}
               </label>
               {paramType === "number" && <span className="text-xs text-gray-500">Value must be between 0 and 1</span>}
-              {paramType === "number" ? (
+              {paramType === "credential" ? (
+                <Select
+                  showSearch
+                  placeholder="Select a logging credential from the registry"
+                  value={config.callback_vars[paramName] || undefined}
+                  onChange={(value) => updateCallbackVar(configIndex, paramName, value)}
+                  style={{ width: "100%" }}
+                  optionFilterProp="value"
+                  notFoundContent="No credentials. Add one under Models + Endpoints -> LLM Credentials."
+                >
+                  {credentialNames.map((name) => (
+                    <Option key={name} value={name}>
+                      {name}
+                    </Option>
+                  ))}
+                </Select>
+              ) : paramType === "number" ? (
                 <NumericalInput
                   step={0.01}
                   width={400}

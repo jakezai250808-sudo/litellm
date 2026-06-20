@@ -83,6 +83,7 @@ _ENABLE_TEAM_STALE_ALIAS_BYPASS: Optional[bool] = None
 
 
 if TYPE_CHECKING:
+    from litellm.integrations.otel.model.destination import OtelDestination
     from litellm.proxy.proxy_server import ProxyConfig as _ProxyConfig
     from litellm.types.proxy.policy_engine import PolicyMatchContext
 
@@ -521,6 +522,44 @@ class KeyAndTeamLoggingSettings:
         ):
             return decrypt_callback_vars(user_api_key_dict.team_metadata).get("logging")
         return None
+
+
+def _resolve_admin_otel_destination(
+    callback_settings_obj: TeamCallbackMetadata,
+) -> Optional["OtelDestination"]:
+    """Resolve a key/team's bound named credential into an OTEL v2 destination.
+
+    The binding lives in admin-owned ``metadata.logging`` (a credential name, not
+    secrets); the request never names or supplies a destination. Returns ``None``
+    when no credential is bound, no OTEL v2 callback is configured, or the
+    credential is unknown/incomplete.
+    """
+    from litellm.integrations.otel.destinations import (
+        LOGGING_CREDENTIAL_NAME_KEY,
+        OTEL_V2_DESTINATION_CALLBACKS,
+        build_destination,
+    )
+
+    callback_vars = callback_settings_obj.callback_vars or {}
+    credential_name = callback_vars.get(LOGGING_CREDENTIAL_NAME_KEY)
+    if not credential_name:
+        return None
+    callback_name = next(
+        (
+            name
+            for name in (callback_settings_obj.success_callback or [])
+            if name in OTEL_V2_DESTINATION_CALLBACKS
+        ),
+        None,
+    )
+    if callback_name is None:
+        return None
+    values = CredentialAccessor.get_credential_values(credential_name)
+    if not values:
+        return None
+    return build_destination(
+        callback_name, {str(key): str(value) for key, value in values.items()}
+    )
 
 
 def _get_dynamic_logging_metadata(
@@ -1790,16 +1829,29 @@ async def add_litellm_data_to_request(
         )
 
     # Team Callbacks controls
+    # A client must never set or override the OTEL v2 trace destination; it is admin
+    # owned and resolved server-side below, so drop any value carried in the request.
+    data.pop("otel_destination", None)
     callback_settings_obj = _get_dynamic_logging_metadata(
         user_api_key_dict=user_api_key_dict, proxy_config=proxy_config
     )
     if callback_settings_obj is not None:
+        from litellm.integrations.otel.destinations import LOGGING_CREDENTIAL_NAME_KEY
+
         data["success_callback"] = callback_settings_obj.success_callback
         data["failure_callback"] = callback_settings_obj.failure_callback
 
         if callback_settings_obj.callback_vars is not None:
-            # unpack callback_vars in data
+            otel_destination = _resolve_admin_otel_destination(callback_settings_obj)
+            if otel_destination is not None:
+                data["otel_destination"] = otel_destination.model_dump()
+            # unpack callback_vars in data, minus the credential reference (a name
+            # resolved server-side above) and the resolved destination itself, so a
+            # callback var can neither be forwarded as a request param nor override
+            # the server-resolved destination
             for k, v in callback_settings_obj.callback_vars.items():
+                if k in (LOGGING_CREDENTIAL_NAME_KEY, "otel_destination"):
+                    continue
                 data[k] = v
 
     # Add disabled callbacks from key metadata

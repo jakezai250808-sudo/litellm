@@ -4150,7 +4150,9 @@ class TestApplyClientTagPolicyPreAuth:
             litellm_budget_table=LiteLLM_BudgetTable(max_budget=0.10),
         )
 
-        async def mock_get_current_spend(counter_key, fallback_spend, max_budget=None, **kwargs):
+        async def mock_get_current_spend(
+            counter_key, fallback_spend, max_budget=None, **kwargs
+        ):
             if counter_key == "spend:tag:paid":
                 return 0.50
             return fallback_spend
@@ -4207,7 +4209,9 @@ class TestApplyClientTagPolicyPreAuth:
             litellm_budget_table=LiteLLM_BudgetTable(max_budget=0.10),
         )
 
-        async def mock_get_current_spend(counter_key, fallback_spend, max_budget=None, **kwargs):
+        async def mock_get_current_spend(
+            counter_key, fallback_spend, max_budget=None, **kwargs
+        ):
             if counter_key == "spend:tag:tenant:acme":
                 return 0.50
             return fallback_spend
@@ -4362,7 +4366,9 @@ class TestApplyKeyTagsPreAuth:
             litellm_budget_table=LiteLLM_BudgetTable(max_budget=0.10),
         )
 
-        async def mock_get_current_spend(counter_key, fallback_spend, max_budget=None, **kwargs):
+        async def mock_get_current_spend(
+            counter_key, fallback_spend, max_budget=None, **kwargs
+        ):
             if counter_key == "spend:tag:engineering":
                 return 0.50
             return fallback_spend
@@ -4413,7 +4419,9 @@ class TestApplyKeyTagsPreAuth:
             litellm_budget_table=LiteLLM_BudgetTable(max_budget=0.10),
         )
 
-        async def mock_get_current_spend(counter_key, fallback_spend, max_budget=None, **kwargs):
+        async def mock_get_current_spend(
+            counter_key, fallback_spend, max_budget=None, **kwargs
+        ):
             if counter_key == "spend:tag:engineering":
                 return 0.05
             return fallback_spend
@@ -4665,3 +4673,71 @@ async def test_add_litellm_data_to_request_claude_code_drop_params(
     )
 
     assert updated.get("drop_params") == expected_drop_params
+
+
+@pytest.fixture
+def _seeded_langfuse_credential():
+    from litellm.models.credentials import CredentialItem
+
+    original = litellm.credential_list
+    litellm.credential_list = [
+        CredentialItem(
+            credential_name="langfuse-eu",
+            credential_values={
+                "langfuse_host": "https://cloud.langfuse.com",
+                "langfuse_public_key": "pk-eu",
+                "langfuse_secret_key": "sk-eu",
+            },
+            credential_info={},
+        )
+    ]
+    try:
+        yield
+    finally:
+        litellm.credential_list = original
+
+
+def test_resolve_admin_otel_destination_from_bound_credential(
+    _seeded_langfuse_credential,
+):
+    from litellm.proxy.litellm_pre_call_utils import _resolve_admin_otel_destination
+
+    callback_obj = TeamCallbackMetadata(
+        success_callback=["langfuse_otel"],
+        callback_vars={"litellm_logging_credential_name": "langfuse-eu"},
+    )
+
+    destination = _resolve_admin_otel_destination(callback_obj)
+
+    assert destination is not None
+    assert destination.endpoint == "https://cloud.langfuse.com/api/public/otel"
+    assert destination.headers["Authorization"].startswith("Basic ")
+
+
+def test_resolve_admin_otel_destination_none_without_binding(
+    _seeded_langfuse_credential,
+):
+    from litellm.proxy.litellm_pre_call_utils import _resolve_admin_otel_destination
+
+    # No credential name bound -> no destination, even with an OTEL callback set.
+    callback_obj = TeamCallbackMetadata(
+        success_callback=["langfuse_otel"], callback_vars={}
+    )
+    assert _resolve_admin_otel_destination(callback_obj) is None
+
+    # Bound name but no OTEL v2 callback configured -> no destination.
+    callback_obj = TeamCallbackMetadata(
+        success_callback=["langsmith"],
+        callback_vars={"litellm_logging_credential_name": "langfuse-eu"},
+    )
+    assert _resolve_admin_otel_destination(callback_obj) is None
+
+
+def test_resolve_admin_otel_destination_unknown_credential_is_none():
+    from litellm.proxy.litellm_pre_call_utils import _resolve_admin_otel_destination
+
+    callback_obj = TeamCallbackMetadata(
+        success_callback=["langfuse_otel"],
+        callback_vars={"litellm_logging_credential_name": "does-not-exist"},
+    )
+    assert _resolve_admin_otel_destination(callback_obj) is None

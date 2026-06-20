@@ -215,7 +215,7 @@ class OpenTelemetryV2(CustomLogger):
                 parent_context=parent_context,
                 start_time_ns=start_time_ns,
                 tracer=self._tenant_tracers.tracer_for(
-                    self.tracer, call.dynamic_params
+                    self.tracer, call.otel_destination
                 ),
             )
         self._open_llm_calls[call_id] = _LLMCallSpan(
@@ -353,7 +353,7 @@ class OpenTelemetryV2(CustomLogger):
             parent_context=parent_ctx,
             start_time_ns=carrier.start_time_ns,
             end_time_ns=end_time_ns,
-            tracer=self._tenant_tracers.tracer_for(self.tracer, call.dynamic_params),
+            tracer=self._tenant_tracers.tracer_for(self.tracer, call.otel_destination),
         )
 
     # ====================================================================== #

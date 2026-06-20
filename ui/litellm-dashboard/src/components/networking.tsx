@@ -209,6 +209,11 @@ export interface CredentialItem {
     custom_llm_provider?: string;
     description?: string;
     required?: boolean;
+    // "logging" tags an admin-owned trace destination (Option A: lives in the
+    // free-form credential_info, no schema migration). Absent = a provider credential.
+    credential_type?: string;
+    // Non-secret destination host/endpoint, surfaced in the logging credentials list.
+    host?: string;
   };
 }
 

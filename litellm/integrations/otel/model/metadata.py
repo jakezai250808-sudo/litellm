@@ -39,12 +39,33 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any, Mapping, cast
 
+from pydantic import ValidationError
+
 from litellm.constants import LITELLM_LOGGING_NO_UPSTREAM_LLM_CALL
+from litellm.integrations.otel.model.destination import OtelDestination
 from litellm.integrations.otel.model.semconv import resolve_operation
 from litellm.integrations.otel.model.utils import as_str
 
 if TYPE_CHECKING:
     from litellm.types.utils import StandardLoggingPayload
+
+
+def _otel_destination(dynamic_params: Any) -> OtelDestination | None:
+    """The admin-resolved OTLP destination carried on ``standard_callback_dynamic_params``.
+
+    Server-set only (the proxy resolves a key/team's named credential and strips any
+    client value), so this is the sole source the v2 router trusts for a per-tenant
+    destination -- request-supplied vendor credentials are never read here.
+    """
+    if not isinstance(dynamic_params, Mapping):
+        return None
+    raw = dynamic_params.get("otel_destination")
+    if not isinstance(raw, Mapping):
+        return None
+    try:
+        return OtelDestination.model_validate(dict(raw))
+    except ValidationError:
+        return None
 
 
 @dataclass(frozen=True)
@@ -210,6 +231,10 @@ class LLMCallEvent:
     # The ``standard_callback_dynamic_params`` routing the call to a per-tenant
     # tracer (its own exporter/endpoint), or ``None`` when the call isn't scoped.
     dynamic_params: Any
+    # The admin-resolved OTLP destination (endpoint + auth headers) for this call's
+    # key/team, or ``None`` when none is bound. The only source the v2 router trusts
+    # for per-tenant routing; never request-derived.
+    otel_destination: OtelDestination | None
     # True for synthetic proxy-gate logs (auth / rate-limit rejections): they fire
     # the ``pre_call`` hook but never made an upstream call, so they get no span.
     is_no_upstream_call: bool
@@ -224,10 +249,12 @@ class LLMCallEvent:
         payload = cast("StandardLoggingPayload", raw_payload) if raw_payload else None
         operation = resolve_operation(as_str(kwargs.get("call_type")))
         model = as_str(kwargs.get("model")) or ""
+        dynamic_params = kwargs.get("standard_callback_dynamic_params")
         return cls(
             call_id=_call_id(payload, kwargs),
             payload=payload,
-            dynamic_params=kwargs.get("standard_callback_dynamic_params"),
+            dynamic_params=dynamic_params,
+            otel_destination=_otel_destination(dynamic_params),
             is_no_upstream_call=bool(kwargs.get(LITELLM_LOGGING_NO_UPSTREAM_LLM_CALL)),
             provisional_span_name=f"{operation.value} {model}".strip(),
         )
