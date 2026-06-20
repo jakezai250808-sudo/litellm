@@ -1,12 +1,13 @@
-"""Per-request multi-tenant tracer routing.
+"""Per-request multi-tenant tracer routing with fan-out.
 
-When a call's key/team is bound to an admin-owned OTEL destination
-(``LLMCallEvent.otel_destination``, resolved server-side from a named credential),
-its spans must export through a ``TracerProvider`` pointed at that destination's
-endpoint with its auth headers. ``TenantTracerCache`` builds and caches one
-provider per distinct destination, and otherwise hands back the logger's default
-tracer. This lets a single logger fan requests out to many tenants without a
-logger per tenant. The destination is never request-derived, so a caller can
+A call's identity chain is assigned a set of admin-owned OTEL destinations
+(``LLMCallEvent.otel_destinations``, resolved server-side from named credentials).
+Its spans must export to ALL of them plus the configured/global exporter, so
+``TenantTracerCache`` builds and caches one ``TracerProvider`` per distinct
+destination SET -- the provider keeps the configured exporters and appends one
+``SpanProcessor`` per destination, so a span is emitted once and copied to each
+(no duplicate spans). With no destinations it hands back the logger's default
+tracer (global only). Destinations are never request-derived, so a caller can
 neither redirect a trace nor spawn providers.
 """
 
@@ -16,7 +17,7 @@ from opentelemetry.sdk.trace import TracerProvider
 from opentelemetry.trace import Tracer
 
 from litellm._logging import verbose_logger
-from litellm.integrations.otel.model.config import OpenTelemetryV2Config
+from litellm.integrations.otel.model.config import ExporterSpec, OpenTelemetryV2Config
 from litellm.integrations.otel.model.destination import OtelDestination
 from litellm.integrations.otel.plumbing.providers import (
     build_tracer_provider,
@@ -60,56 +61,68 @@ class TenantTracerCache:
         self._config = config
         self._callback_name = callback_name
         self._tracer_name = tracer_name
-        self._providers: (
-            "OrderedDict[tuple[str, tuple[tuple[str, str], ...]], TracerProvider]"
-        ) = OrderedDict()
+        self._providers: "OrderedDict[tuple[tuple[str, tuple[tuple[str, str], ...]], ...], TracerProvider]" = (OrderedDict())
 
     def tracer_for(
-        self, default: Tracer, destination: OtelDestination | None
+        self, default: Tracer, destinations: "tuple[OtelDestination, ...]"
     ) -> Tracer:
         """Return the tracer for this request.
 
-        Use ``default`` unless an admin-owned destination is bound to the call's
-        key/team, in which case build (or reuse) a provider that exports to it. The
-        cache is a bounded LRU: the least-recently-used provider is flushed and shut
-        down on overflow so its exporter threads don't accumulate.
+        ``destinations`` are the admin-resolved exporters (for this backend) that the
+        request's identity chain is assigned. Empty -> the logger's default tracer
+        (the global/configured exporter only = deny). Otherwise build (or reuse) a
+        provider that exports to the configured exporters PLUS every destination, so
+        one span is emitted once and copied to all (fan-out, no duplicate spans). The
+        cache is a bounded LRU keyed on the destination SET.
         """
-        if destination is None:
+        if not destinations:
             return default
-        cache_key = (destination.endpoint, tuple(sorted(destination.headers.items())))
+        cache_key = tuple(
+            sorted((d.endpoint, tuple(sorted(d.headers.items()))) for d in destinations)
+        )
         provider = self._providers.get(cache_key)
         if provider is not None:
             self._providers.move_to_end(cache_key)
         else:
-            provider = build_tracer_provider(self._config_with_destination(destination))
+            provider = build_tracer_provider(
+                self._config_with_destinations(destinations)
+            )
             self._providers[cache_key] = provider
             if len(self._providers) > _MAX_CACHED_PROVIDERS:
                 _, evicted = self._providers.popitem(last=False)
                 _shutdown_provider(evicted)
         return get_tracer(provider, self._tracer_name)
 
-    def _config_with_destination(
-        self, destination: OtelDestination
-    ) -> OpenTelemetryV2Config:
-        """Clone the config, pointing this integration's own exporter at ``destination``.
-
-        The endpoint and headers apply only to the exporter this integration
-        contributed (``spec.owner == self._callback_name``), so a tenant's
-        destination never rewrites a co-configured backend's exporter. Setting the
-        endpoint per destination (not just the headers) is what makes a tenant on a
-        different host export there instead of hitting the env host and being dropped.
-        """
-        update = {
-            "endpoint": destination.endpoint,
-            "headers": destination.header_string(),
-        }
-        exporters = [
-            (
-                spec.model_copy(update=update)
-                if spec.owner == self._callback_name
+    def _owned_otlp_kind(self) -> str:
+        """The OTLP transport of this integration's own exporter (langfuse -> http,
+        arize -> grpc), used for the destinations appended below."""
+        for spec in self._config.exporters:
+            if (
+                spec.owner == self._callback_name
                 and spec.kind.lower() not in _NON_OTLP_KINDS
-                else spec
+            ):
+                return spec.kind
+        return "otlp_http"
+
+    def _config_with_destinations(
+        self, destinations: "tuple[OtelDestination, ...]"
+    ) -> OpenTelemetryV2Config:
+        """Clone the config, KEEPING its exporters (so the global/default still
+        receives) and APPENDING one exporter per resolved destination. The shared
+        ``TracerProvider`` attaches one ``SpanProcessor`` per spec, so a single span
+        is emitted once and exported to the global destination plus every assigned
+        one. Each appended exporter's endpoint is the resolved host (the cross-host
+        fix) with its own auth headers (per-destination isolation)."""
+        kind = self._owned_otlp_kind()
+        appended = [
+            ExporterSpec(
+                kind=kind,
+                endpoint=d.endpoint,
+                headers=d.header_string(),
+                owner=None,
             )
-            for spec in self._config.exporters
+            for d in destinations
         ]
-        return self._config.model_copy(update={"exporters": exporters})
+        return self._config.model_copy(
+            update={"exporters": [*self._config.exporters, *appended]}
+        )

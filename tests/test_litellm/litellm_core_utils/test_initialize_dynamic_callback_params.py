@@ -36,38 +36,44 @@ def test_resolves_plain_values_from_metadata():
     assert params.get("langfuse_host") == "https://test.langfuse.com"
 
 
-def test_otel_destination_read_from_top_level_only():
-    """The admin-resolved OTEL destination is carried server-side on top-level
-    kwargs (the proxy strips any client value first). It must surface on the
-    dynamic params so the v2 logger can route on it."""
-    destination = {
-        "endpoint": "https://cloud.langfuse.com/api/public/otel",
-        "headers": {"Authorization": "Basic ADMIN"},
-    }
+def test_otel_destinations_read_from_top_level_only():
+    """The admin-resolved OTEL destinations are carried server-side on top-level
+    kwargs (the proxy strips any client value first). They must surface on the
+    dynamic params so the v2 logger can fan out to them."""
+    destinations = [
+        {
+            "callback_name": "langfuse_otel",
+            "endpoint": "https://cloud.langfuse.com/api/public/otel",
+            "headers": {"Authorization": "Basic ADMIN"},
+        }
+    ]
 
     params = initialize_standard_callback_dynamic_params(
-        {"otel_destination": destination}
+        {"otel_destinations": destinations}
     )
 
-    assert params.get("otel_destination") == destination
+    assert params.get("otel_destinations") == destinations
 
 
-def test_otel_destination_never_read_from_request_metadata():
-    """A request body/metadata must not be able to inject an OTEL destination:
-    otel_destination is deliberately absent from the request-read whitelist, so a
+def test_otel_destinations_never_read_from_request_metadata():
+    """A request body/metadata must not be able to inject OTEL destinations:
+    otel_destinations is deliberately absent from the request-read whitelist, so a
     value nested in metadata is ignored. Guards the trust boundary."""
     kwargs = {
         "metadata": {
-            "otel_destination": {
-                "endpoint": "https://attacker.example/api/public/otel",
-                "headers": {"Authorization": "Basic ATTACKER"},
-            }
+            "otel_destinations": [
+                {
+                    "callback_name": "langfuse_otel",
+                    "endpoint": "https://attacker.example/api/public/otel",
+                    "headers": {"Authorization": "Basic ATTACKER"},
+                }
+            ]
         }
     }
 
     params = initialize_standard_callback_dynamic_params(kwargs)
 
-    assert params.get("otel_destination") is None
+    assert params.get("otel_destinations") is None
 
 
 def test_env_reference_at_top_level_raises_with_guidance():

@@ -1,11 +1,11 @@
-"""Per-tenant tracer routing on admin-owned OTEL destinations.
+"""Per-tenant tracer routing on admin-owned OTEL destinations, with fan-out.
 
-A trace destination is resolved server-side from a key/team's named credential
-into an ``OtelDestination`` (endpoint + headers); the v2 logger routes on that
-and never on request-supplied vendor credentials. These tests lock the contract:
-the request cannot route a trace, the endpoint follows the destination's host
-(cross-host fix), and one tenant's destination never rewrites a co-configured
-backend's exporter.
+A request's identity chain is assigned a set of admin-owned exporters; the v2 logger
+fans the trace out to all of them (plus the configured/global exporter), and never
+routes on request-supplied vendor credentials. These tests lock the contract: the
+request cannot route a trace, each destination's endpoint follows its resolved host
+(cross-host fix), the configured exporters are kept (global also receives), and a
+logger only exports the destinations tagged with its own backend.
 """
 
 import os
@@ -24,49 +24,71 @@ from litellm.integrations.otel.plumbing.routing import TenantTracerCache
 
 
 def _cache(callback_name, exporters=None):
-    cfg = OpenTelemetryV2Config(exporters=exporters or [ExporterSpec(kind="in_memory")])
+    cfg = OpenTelemetryV2Config(
+        exporters=exporters or [ExporterSpec(kind="in_memory", owner=callback_name)]
+    )
     return TenantTracerCache(cfg, callback_name, "litellm")
 
 
-def _dest(endpoint="https://eu.example/api/public/otel", auth="Basic AAAA"):
-    return OtelDestination(endpoint=endpoint, headers={"Authorization": auth})
+def _dest(endpoint, auth="Basic AAAA", backend="langfuse_otel"):
+    return OtelDestination(
+        endpoint=endpoint, headers={"Authorization": auth}, callback_name=backend
+    )
 
 
-# --- routing only happens for an admin destination ------------------------- #
+def _event(destinations):
+    return LLMCallEvent.from_dict(
+        {
+            "standard_callback_dynamic_params": {"otel_destinations": destinations},
+            "call_type": "acompletion",
+            "model": "gpt-4o",
+        }
+    )
 
 
-def test_no_destination_uses_default_tracer():
+# --- routing only happens for admin destinations --------------------------- #
+
+
+def test_no_destinations_uses_default_tracer():
     cache = _cache("langfuse_otel")
     default = NoOpTracer()
-    assert cache.tracer_for(default, None) is default
+    assert cache.tracer_for(default, ()) is default
     assert cache._providers == {}
 
 
-def test_provider_cached_per_destination():
+def test_provider_cached_per_destination_set():
     cache = _cache("langfuse_otel")
     default = NoOpTracer()
-    a = _dest(endpoint="https://eu.example/api/public/otel", auth="Basic A")
-    b = _dest(endpoint="https://eu.example/api/public/otel", auth="Basic B")
+    a = (_dest("https://eu.example/v1", "Basic A"),)
+    b = (_dest("https://eu.example/v1", "Basic B"),)
 
     cache.tracer_for(default, a)
-    cache.tracer_for(default, a)  # same destination -> reuse
+    cache.tracer_for(default, a)  # same set -> reuse
     assert len(cache._providers) == 1
     cache.tracer_for(default, b)  # different creds -> new provider
     assert len(cache._providers) == 2
 
 
 def test_different_host_is_a_distinct_provider():
-    """Two destinations with identical headers but different hosts must not
-    collide. The cache key includes the endpoint; a headers-only key (the old
-    behavior) would merge them and one tenant's spans would hit the other host."""
+    """Two destinations with identical headers but different hosts must not collide;
+    the cache key includes each endpoint."""
     cache = _cache("langfuse_otel")
     default = NoOpTracer()
-    eu = _dest(endpoint="https://cloud.langfuse.com/api/public/otel", auth="Basic X")
-    us = _dest(endpoint="https://us.cloud.langfuse.com/api/public/otel", auth="Basic X")
-
+    eu = (_dest("https://cloud.langfuse.com/api/public/otel", "Basic X"),)
+    us = (_dest("https://us.cloud.langfuse.com/api/public/otel", "Basic X"),)
     cache.tracer_for(default, eu)
     cache.tracer_for(default, us)
     assert len(cache._providers) == 2
+
+
+def test_destination_set_is_order_independent():
+    cache = _cache("langfuse_otel")
+    default = NoOpTracer()
+    a = _dest("https://a/v1", "Basic A")
+    b = _dest("https://b/v1", "Basic B")
+    cache.tracer_for(default, (a, b))
+    cache.tracer_for(default, (b, a))  # same set, different order -> one provider
+    assert len(cache._providers) == 1
 
 
 def test_provider_cache_is_bounded_and_evicts_lru(monkeypatch):
@@ -77,30 +99,23 @@ def test_provider_cache_is_bounded_and_evicts_lru(monkeypatch):
     monkeypatch.setattr(
         routing_mod, "_shutdown_provider", lambda p: shut_down.append(p)
     )
-
     cache = _cache("langfuse_otel")
     default = NoOpTracer()
-
-    def dest(host):
-        return _dest(endpoint=f"https://{host}/api/public/otel", auth="Basic K")
-
-    cache.tracer_for(default, dest("1"))
-    cache.tracer_for(default, dest("2"))
-    cache.tracer_for(default, dest("1"))  # touch "1" -> "2" is now LRU
-    cache.tracer_for(default, dest("3"))  # overflow -> evict "2"
-
+    cache.tracer_for(default, (_dest("https://1/v1"),))
+    cache.tracer_for(default, (_dest("https://2/v1"),))
+    cache.tracer_for(default, (_dest("https://1/v1"),))  # touch "1" -> "2" is LRU
+    cache.tracer_for(default, (_dest("https://3/v1"),))  # overflow -> evict "2"
     assert len(cache._providers) == 2
     assert len(shut_down) == 1
 
 
-# --- the destination sets the endpoint (cross-host fix), scoped to its owner - #
+# --- fan-out: keep the configured exporters, append one per destination ----- #
 
 
 @pytest.mark.parametrize("owner", ["langfuse_otel", "arize", "weave_otel"])
-def test_destination_sets_endpoint_and_headers_on_owned_exporter_only(owner):
-    # Exporter-invariant by construction: every backend's resolved destination sets
-    # BOTH endpoint and headers on its own exporter. Parametrized so the cross-host
-    # fix is asserted for langfuse, arize, and weave, not just one.
+def test_fan_out_appends_destination_with_resolved_endpoint(owner):
+    # The configured (global) exporter is kept; each destination is appended with its
+    # OWN resolved endpoint + headers (the cross-host fix, per owner).
     cache = _cache(
         owner,
         exporters=[
@@ -109,21 +124,22 @@ def test_destination_sets_endpoint_and_headers_on_owned_exporter_only(owner):
                 endpoint="https://env-host.example/v1",
                 headers="Authorization=Basic ENV",
                 owner=owner,
-            ),
-            ExporterSpec(kind="in_memory", owner=owner),
+            )
         ],
     )
-    new_cfg = cache._config_with_destination(
-        _dest(endpoint="https://resolved-host.example/v1", auth="Basic TEAM")
+    new = cache._config_with_destinations(
+        (_dest("https://resolved.example/v1", "Basic TEAM", backend=owner),)
     )
-    otlp, in_mem = new_cfg.exporters
-    # The endpoint follows the resolved host, not the env-pinned one -> no 401.
-    assert otlp.endpoint == "https://resolved-host.example/v1"
-    assert otlp.headers == "Authorization=Basic TEAM"
-    assert in_mem.headers is None and in_mem.endpoint is None
+    # global kept verbatim
+    assert new.exporters[0].endpoint == "https://env-host.example/v1"
+    assert new.exporters[0].headers == "Authorization=Basic ENV"
+    # destination appended at the resolved host with its own auth
+    assert new.exporters[-1].endpoint == "https://resolved.example/v1"
+    assert new.exporters[-1].headers == "Authorization=Basic TEAM"
+    assert len(new.exporters) == 2
 
 
-def test_destination_does_not_leak_to_other_owners_exporter():
+def test_fan_out_preserves_co_configured_exporters():
     cache = _cache(
         "langfuse_otel",
         exporters=[
@@ -134,12 +150,6 @@ def test_destination_does_not_leak_to_other_owners_exporter():
                 owner=None,
             ),
             ExporterSpec(
-                kind="otlp_grpc",
-                endpoint="https://otlp.arize.com/v1",
-                headers="space_id=base,api_key=base",
-                owner="arize",
-            ),
-            ExporterSpec(
                 kind="otlp_http",
                 endpoint="https://us.cloud.langfuse.com/api/public/otel",
                 headers="Authorization=Basic ENV",
@@ -147,50 +157,58 @@ def test_destination_does_not_leak_to_other_owners_exporter():
             ),
         ],
     )
-    new_cfg = cache._config_with_destination(
-        _dest(endpoint="https://cloud.langfuse.com/api/public/otel", auth="Basic TEAM")
+    new = cache._config_with_destinations(
+        (_dest("https://cloud.langfuse.com/api/public/otel", "Basic TEAM"),)
     )
-    by_owner = {e.owner: e for e in new_cfg.exporters}
-    assert (
-        by_owner["langfuse_otel"].endpoint
-        == "https://cloud.langfuse.com/api/public/otel"
-    )
-    assert by_owner["langfuse_otel"].headers == "Authorization=Basic TEAM"
-    # Co-configured backends are untouched.
-    assert by_owner[None].endpoint == "http://self-hosted-collector:4318"
-    assert by_owner[None].headers == "x=base-collector"
-    assert by_owner["arize"].headers == "space_id=base,api_key=base"
+    # both originals preserved unchanged (no rewrite/leak)
+    assert new.exporters[0].endpoint == "http://self-hosted-collector:4318"
+    assert new.exporters[0].headers == "x=base-collector"
+    assert new.exporters[1].headers == "Authorization=Basic ENV"
+    # exactly one appended
+    assert new.exporters[-1].endpoint == "https://cloud.langfuse.com/api/public/otel"
+    assert len(new.exporters) == 3
 
 
-# --- the security lock: request credentials never route a trace ------------- #
+def test_fan_out_to_many_destinations_is_one_provider_with_all_exporters():
+    cache = _cache(
+        "langfuse_otel",
+        exporters=[
+            ExporterSpec(
+                kind="otlp_http", endpoint="https://env/v1", owner="langfuse_otel"
+            )
+        ],
+    )
+    new = cache._config_with_destinations(
+        (_dest("https://a/v1", "Basic A"), _dest("https://b/v1", "Basic B"))
+    )
+    # global + 2 destinations -> 3 span processors, one provider, one span copied to all
+    assert [e.endpoint for e in new.exporters] == [
+        "https://env/v1",
+        "https://a/v1",
+        "https://b/v1",
+    ]
+    cache.tracer_for(NoOpTracer(), (_dest("https://a/v1"), _dest("https://b/v1")))
+    assert len(cache._providers) == 1
+
+
+# --- security: request credentials never route a trace --------------------- #
 
 
 @pytest.mark.parametrize(
-    "callback_name, request_creds",
+    "request_creds",
     [
-        (
-            "langfuse_otel",
-            {
-                "langfuse_public_key": "pk-attacker",
-                "langfuse_secret_key": "sk-attacker",
-                "langfuse_host": "https://attacker.example",
-            },
-        ),
-        ("arize", {"arize_api_key": "K-attacker", "arize_space_id": "S-attacker"}),
-        (
-            "weave_otel",
-            {
-                "wandb_api_key": "w-attacker",
-                "weave_project_id": "p/attacker",
-                "weave_endpoint": "https://attacker.example/otel",
-            },
-        ),
+        {
+            "langfuse_public_key": "pk-attacker",
+            "langfuse_secret_key": "sk-attacker",
+            "langfuse_host": "https://attacker.example",
+        },
+        {"arize_api_key": "K-attacker", "arize_space_id": "S-attacker"},
+        {"wandb_api_key": "w-attacker", "weave_endpoint": "https://attacker/otel"},
     ],
 )
-def test_request_credentials_are_inert_on_v2(callback_name, request_creds):
+def test_request_credentials_are_inert_on_v2(request_creds):
     """Any backend's credentials in the request's dynamic params (no admin
-    destination) must NOT produce a per-tenant destination, so the trace is not
-    redirected. Parametrized across langfuse, arize, and weave."""
+    destinations) produce no per-tenant routing."""
     event = LLMCallEvent.from_dict(
         {
             "standard_callback_dynamic_params": request_creds,
@@ -198,30 +216,52 @@ def test_request_credentials_are_inert_on_v2(callback_name, request_creds):
             "model": "gpt-4o",
         }
     )
-    assert event.otel_destination is None
-    cache = _cache(callback_name)
+    assert event.otel_destinations == ()
+    cache = _cache("langfuse_otel")
     default = NoOpTracer()
-    assert cache.tracer_for(default, event.otel_destination) is default
+    assert cache.tracer_for(default, event.otel_destinations) is default
     assert cache._providers == {}
 
 
-def test_admin_destination_routes():
-    event = LLMCallEvent.from_dict(
-        {
-            "standard_callback_dynamic_params": {
-                "otel_destination": {
-                    "endpoint": "https://cloud.langfuse.com/api/public/otel",
-                    "headers": {"Authorization": "Basic ADMIN"},
-                }
-            },
-            "call_type": "acompletion",
-            "model": "gpt-4o",
-        }
+def test_admin_destinations_route():
+    event = _event(
+        [
+            {
+                "callback_name": "langfuse_otel",
+                "endpoint": "https://cloud.langfuse.com/api/public/otel",
+                "headers": {"Authorization": "Basic ADMIN"},
+            }
+        ]
     )
-    assert event.otel_destination is not None
-    assert (
-        event.otel_destination.endpoint == "https://cloud.langfuse.com/api/public/otel"
-    )
+    assert len(event.otel_destinations) == 1
     cache = _cache("langfuse_otel")
-    cache.tracer_for(NoOpTracer(), event.otel_destination)
+    cache.tracer_for(NoOpTracer(), event.otel_destinations)
     assert len(cache._providers) == 1
+
+
+# --- a logger only exports the destinations tagged with its own backend ----- #
+
+
+def test_logger_filters_destinations_to_its_backend():
+    from litellm.integrations.otel.logger import OpenTelemetryV2
+
+    event = _event(
+        [
+            {
+                "callback_name": "langfuse_otel",
+                "endpoint": "https://lf/api/public/otel",
+                "headers": {"Authorization": "Basic A"},
+            },
+            {
+                "callback_name": "arize",
+                "endpoint": "https://otlp.arize.com/v1",
+                "headers": {"space_id": "S"},
+            },
+        ]
+    )
+
+    class _Shim:
+        callback_name = "langfuse_otel"
+
+    got = OpenTelemetryV2._destinations_for_backend(_Shim(), event)
+    assert [d.endpoint for d in got] == ["https://lf/api/public/otel"]

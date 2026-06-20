@@ -50,22 +50,29 @@ if TYPE_CHECKING:
     from litellm.types.utils import StandardLoggingPayload
 
 
-def _otel_destination(dynamic_params: Any) -> OtelDestination | None:
-    """The admin-resolved OTLP destination carried on ``standard_callback_dynamic_params``.
+def _otel_destinations(dynamic_params: Any) -> tuple[OtelDestination, ...]:
+    """The admin-resolved OTLP destinations carried on ``standard_callback_dynamic_params``.
 
-    Server-set only (the proxy resolves a key/team's named credential and strips any
-    client value), so this is the sole source the v2 router trusts for a per-tenant
-    destination -- request-supplied vendor credentials are never read here.
+    Server-set only (the proxy resolves the exporters assigned to the request's
+    identity chain and strips any client value), so this is the sole source the v2
+    router trusts -- request-supplied vendor credentials are never read here. A
+    request fans out to every destination here; each logger keeps only the ones
+    tagged with its own backend.
     """
     if not isinstance(dynamic_params, Mapping):
-        return None
-    raw = dynamic_params.get("otel_destination")
-    if not isinstance(raw, Mapping):
-        return None
-    try:
-        return OtelDestination.model_validate(dict(raw))
-    except ValidationError:
-        return None
+        return ()
+    raw = dynamic_params.get("otel_destinations")
+    if not isinstance(raw, list):
+        return ()
+    parsed: list[OtelDestination] = []
+    for item in raw:
+        if not isinstance(item, Mapping):
+            continue
+        try:
+            parsed.append(OtelDestination.model_validate(dict(item)))
+        except ValidationError:
+            continue
+    return tuple(parsed)
 
 
 @dataclass(frozen=True)
@@ -231,10 +238,10 @@ class LLMCallEvent:
     # The ``standard_callback_dynamic_params`` routing the call to a per-tenant
     # tracer (its own exporter/endpoint), or ``None`` when the call isn't scoped.
     dynamic_params: Any
-    # The admin-resolved OTLP destination (endpoint + auth headers) for this call's
-    # key/team, or ``None`` when none is bound. The only source the v2 router trusts
-    # for per-tenant routing; never request-derived.
-    otel_destination: OtelDestination | None
+    # The admin-resolved OTLP destinations (endpoint + auth headers) for this call's
+    # identity chain, fanned out to. Empty when none are assigned. The only source the
+    # v2 router trusts for per-tenant routing; never request-derived.
+    otel_destinations: tuple[OtelDestination, ...]
     # True for synthetic proxy-gate logs (auth / rate-limit rejections): they fire
     # the ``pre_call`` hook but never made an upstream call, so they get no span.
     is_no_upstream_call: bool
@@ -254,7 +261,7 @@ class LLMCallEvent:
             call_id=_call_id(payload, kwargs),
             payload=payload,
             dynamic_params=dynamic_params,
-            otel_destination=_otel_destination(dynamic_params),
+            otel_destinations=_otel_destinations(dynamic_params),
             is_no_upstream_call=bool(kwargs.get(LITELLM_LOGGING_NO_UPSTREAM_LLM_CALL)),
             provisional_span_name=f"{operation.value} {model}".strip(),
         )

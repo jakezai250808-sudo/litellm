@@ -83,7 +83,6 @@ _ENABLE_TEAM_STALE_ALIAS_BYPASS: Optional[bool] = None
 
 
 if TYPE_CHECKING:
-    from litellm.integrations.otel.model.destination import OtelDestination
     from litellm.proxy.proxy_server import ProxyConfig as _ProxyConfig
     from litellm.types.proxy.policy_engine import PolicyMatchContext
 
@@ -524,42 +523,129 @@ class KeyAndTeamLoggingSettings:
         return None
 
 
-def _resolve_admin_otel_destination(
-    callback_settings_obj: TeamCallbackMetadata,
-) -> Optional["OtelDestination"]:
-    """Resolve a key/team's bound named credential into an OTEL v2 destination.
+async def _union_logging_exporter_names(user_api_key_dict: UserAPIKeyAuth) -> set:
+    """The union of admin-assigned exporter names across the request's identity chain.
 
-    The binding lives in admin-owned ``metadata.logging`` (a credential name, not
-    secrets); the request never names or supplies a destination. Returns ``None``
-    when no credential is bound, no OTEL v2 callback is configured, or the
-    credential is unknown/incomplete.
+    Resolves each level from its OWN record: the key's ``metadata`` is shadowed by the
+    team's on the auth object, so it is fetched fresh via ``get_key_object``; the org's
+    metadata is fetched via ``get_org_object``; the team's is already its own on
+    ``team_metadata``. Internal-user is intentionally not a routing dimension. The lists
+    are admin-owned; the request never supplies them. Degrades to team-only when no DB
+    is connected (SDK mode).
     """
-    from litellm.integrations.otel.destinations import (
-        LOGGING_CREDENTIAL_NAME_KEY,
-        OTEL_V2_DESTINATION_CALLBACKS,
-        build_destination,
-    )
+    from litellm.proxy import proxy_server
+    from litellm.proxy.auth.auth_checks import get_key_object, get_org_object
 
-    callback_vars = callback_settings_obj.callback_vars or {}
-    credential_name = callback_vars.get(LOGGING_CREDENTIAL_NAME_KEY)
-    if not credential_name:
-        return None
-    callback_name = next(
-        (
-            name
-            for name in (callback_settings_obj.success_callback or [])
-            if name in OTEL_V2_DESTINATION_CALLBACKS
-        ),
-        None,
-    )
-    if callback_name is None:
-        return None
-    values = CredentialAccessor.get_credential_values(credential_name)
-    if not values:
-        return None
-    return build_destination(
-        callback_name, {str(key): str(value) for key, value in values.items()}
-    )
+    names: set = set()
+
+    def _add(metadata: Any) -> None:
+        if not isinstance(metadata, dict):
+            return
+        assigned = metadata.get("logging_exporters")
+        if isinstance(assigned, list):
+            names.update(str(name) for name in assigned)
+
+    prisma_client = proxy_server.prisma_client
+    cache = proxy_server.user_api_key_cache
+    span = getattr(user_api_key_dict, "parent_otel_span", None)
+
+    # KEY: the key's own metadata (the auth object's .metadata is the team's shadow).
+    if user_api_key_dict.token and prisma_client is not None:
+        try:
+            key_obj = await get_key_object(
+                hashed_token=user_api_key_dict.token,
+                prisma_client=prisma_client,
+                user_api_key_cache=cache,
+                parent_otel_span=span,
+                proxy_logging_obj=proxy_server.proxy_logging_obj,
+            )
+            _add(key_obj.metadata)
+        except Exception:
+            pass
+
+    # TEAM: team_metadata is already the team's own.
+    _add(user_api_key_dict.team_metadata)
+
+    # ORG: the org's own metadata (central catch-all).
+    if user_api_key_dict.org_id and prisma_client is not None:
+        try:
+            org_obj = await get_org_object(
+                org_id=user_api_key_dict.org_id,
+                prisma_client=prisma_client,
+                user_api_key_cache=cache,
+                parent_otel_span=span,
+                proxy_logging_obj=proxy_server.proxy_logging_obj,
+            )
+            _add(getattr(org_obj, "metadata", None))
+        except Exception:
+            pass
+
+    return names
+
+
+async def _resolve_logging_exporters(
+    user_api_key_dict: UserAPIKeyAuth,
+) -> "tuple[list, list]":
+    """Resolve the identity chain's assigned exporter names to (destinations, backends).
+
+    Each name is looked up in the admin-owned credential registry (must be a logging
+    credential); its backend comes from ``credential_info.description`` and its
+    destination from ``build_destination``. Destinations are deduped on (endpoint,
+    headers). The request never names or supplies a destination. Returns ([], []) when
+    nothing is assigned.
+    """
+    from litellm.integrations.otel.destinations import build_destination
+
+    names = await _union_logging_exporter_names(user_api_key_dict)
+    if not names:
+        return [], []
+    destinations: list = []
+    backends: list = []
+    seen: set = set()
+    for credential in litellm.credential_list:
+        if credential.credential_name not in names:
+            continue
+        info = credential.credential_info or {}
+        if info.get("credential_type") != "logging":
+            continue
+        backend = info.get("description")
+        if not backend:
+            continue
+        values = {
+            str(key): str(value)
+            for key, value in (credential.credential_values or {}).items()
+        }
+        destination = build_destination(backend, values)
+        if destination is None:
+            continue
+        identity = (destination.endpoint, tuple(sorted(destination.headers.items())))
+        if identity in seen:
+            continue
+        seen.add(identity)
+        destinations.append(
+            {
+                "callback_name": backend,
+                "endpoint": destination.endpoint,
+                "headers": destination.headers,
+            }
+        )
+        if backend not in backends:
+            backends.append(backend)
+    return destinations, backends
+
+
+async def _apply_admin_logging_exporters(
+    data: dict, user_api_key_dict: UserAPIKeyAuth
+) -> None:
+    """Stamp the resolved fan-out destinations onto ``data`` and activate their
+    backends. A client value was already stripped by the caller; default-deny means
+    an identity with no assignment gets no per-tenant destination here."""
+    destinations, backends = await _resolve_logging_exporters(user_api_key_dict)
+    if not destinations:
+        return
+    data["otel_destinations"] = destinations
+    existing = data.get("success_callback") or []
+    data["success_callback"] = list(dict.fromkeys([*existing, *backends]))
 
 
 def _get_dynamic_logging_metadata(
@@ -1829,30 +1915,24 @@ async def add_litellm_data_to_request(
         )
 
     # Team Callbacks controls
-    # A client must never set or override the OTEL v2 trace destination; it is admin
-    # owned and resolved server-side below, so drop any value carried in the request.
-    data.pop("otel_destination", None)
+    # A client must never set or override OTEL destinations; they are admin-owned and
+    # resolved server-side below, so drop any value carried in the request.
+    data.pop("otel_destinations", None)
     callback_settings_obj = _get_dynamic_logging_metadata(
         user_api_key_dict=user_api_key_dict, proxy_config=proxy_config
     )
     if callback_settings_obj is not None:
-        from litellm.integrations.otel.destinations import LOGGING_CREDENTIAL_NAME_KEY
-
         data["success_callback"] = callback_settings_obj.success_callback
         data["failure_callback"] = callback_settings_obj.failure_callback
 
         if callback_settings_obj.callback_vars is not None:
-            otel_destination = _resolve_admin_otel_destination(callback_settings_obj)
-            if otel_destination is not None:
-                data["otel_destination"] = otel_destination.model_dump()
-            # unpack callback_vars in data, minus the credential reference (a name
-            # resolved server-side above) and the resolved destination itself, so a
-            # callback var can neither be forwarded as a request param nor override
-            # the server-resolved destination
             for k, v in callback_settings_obj.callback_vars.items():
-                if k in (LOGGING_CREDENTIAL_NAME_KEY, "otel_destination"):
-                    continue
                 data[k] = v
+
+    # Admin-owned exporter assignment: resolve the union of exporters assigned across
+    # the request's identity chain (key + team + org) into fan-out destinations and
+    # activate their backends. Default-deny: an unassigned identity gets none.
+    await _apply_admin_logging_exporters(data, user_api_key_dict)
 
     # Add disabled callbacks from key metadata
     if (

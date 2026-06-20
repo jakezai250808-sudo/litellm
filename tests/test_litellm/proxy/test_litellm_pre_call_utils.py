@@ -4676,7 +4676,7 @@ async def test_add_litellm_data_to_request_claude_code_drop_params(
 
 
 @pytest.fixture
-def _seeded_langfuse_credential():
+def _seeded_logging_credentials():
     from litellm.models.credentials import CredentialItem
 
     original = litellm.credential_list
@@ -4688,8 +4688,22 @@ def _seeded_langfuse_credential():
                 "langfuse_public_key": "pk-eu",
                 "langfuse_secret_key": "sk-eu",
             },
-            credential_info={},
-        )
+            credential_info={
+                "credential_type": "logging",
+                "description": "langfuse_otel",
+            },
+        ),
+        CredentialItem(
+            credential_name="arize-prod",
+            credential_values={"arize_space_id": "S", "arize_api_key": "K"},
+            credential_info={"credential_type": "logging", "description": "arize"},
+        ),
+        # A provider credential that must never resolve as a logging destination.
+        CredentialItem(
+            credential_name="openai-key",
+            credential_values={"api_key": "sk-openai"},
+            credential_info={"custom_llm_provider": "openai"},
+        ),
     ]
     try:
         yield
@@ -4697,47 +4711,106 @@ def _seeded_langfuse_credential():
         litellm.credential_list = original
 
 
-def test_resolve_admin_otel_destination_from_bound_credential(
-    _seeded_langfuse_credential,
+def _auth(team_exporters=None, token=None, org_id=None):
+    return UserAPIKeyAuth(
+        api_key="hashed-key",
+        token=token,
+        org_id=org_id,
+        team_metadata=({"logging_exporters": team_exporters} if team_exporters else {}),
+    )
+
+
+@pytest.mark.asyncio
+async def test_resolve_logging_exporters_team_level(_seeded_logging_credentials):
+    # team_metadata is the team's own (not shadowed); resolves without a DB fetch.
+    from litellm.proxy.litellm_pre_call_utils import _resolve_logging_exporters
+
+    destinations, backends = await _resolve_logging_exporters(
+        _auth(team_exporters=["langfuse-eu"])
+    )
+    assert {d["endpoint"] for d in destinations} == {
+        "https://cloud.langfuse.com/api/public/otel"
+    }
+    assert backends == ["langfuse_otel"]
+
+
+@pytest.mark.asyncio
+async def test_resolve_logging_exporters_unions_key_team_org(
+    _seeded_logging_credentials, monkeypatch
 ):
-    from litellm.proxy.litellm_pre_call_utils import _resolve_admin_otel_destination
+    # key + org are read from their OWN records (the key's .metadata is team-shadowed),
+    # team from team_metadata. All three union, deduped.
+    from types import SimpleNamespace
 
-    callback_obj = TeamCallbackMetadata(
-        success_callback=["langfuse_otel"],
-        callback_vars={"litellm_logging_credential_name": "langfuse-eu"},
+    import litellm.proxy.proxy_server as proxy_server
+    from litellm.proxy.auth import auth_checks
+    from litellm.proxy.litellm_pre_call_utils import _resolve_logging_exporters
+
+    monkeypatch.setattr(proxy_server, "prisma_client", MagicMock())
+    monkeypatch.setattr(
+        auth_checks,
+        "get_key_object",
+        AsyncMock(
+            return_value=SimpleNamespace(metadata={"logging_exporters": ["arize-prod"]})
+        ),
+    )
+    monkeypatch.setattr(
+        auth_checks,
+        "get_org_object",
+        AsyncMock(
+            return_value=SimpleNamespace(
+                metadata={"logging_exporters": ["langfuse-eu"]}
+            )
+        ),
     )
 
-    destination = _resolve_admin_otel_destination(callback_obj)
+    destinations, backends = await _resolve_logging_exporters(
+        _auth(team_exporters=["langfuse-eu"], token="hashed-key", org_id="org-1")
+    )
 
-    assert destination is not None
-    assert destination.endpoint == "https://cloud.langfuse.com/api/public/otel"
-    assert destination.headers["Authorization"].startswith("Basic ")
+    assert {d["endpoint"] for d in destinations} == {
+        "https://cloud.langfuse.com/api/public/otel",  # team + org (deduped)
+        "https://otlp.arize.com/v1",  # key
+    }
+    assert set(backends) == {"langfuse_otel", "arize"}
 
 
-def test_resolve_admin_otel_destination_none_without_binding(
-    _seeded_langfuse_credential,
+@pytest.mark.asyncio
+async def test_resolve_logging_exporters_empty_without_assignment(
+    _seeded_logging_credentials,
 ):
-    from litellm.proxy.litellm_pre_call_utils import _resolve_admin_otel_destination
+    from litellm.proxy.litellm_pre_call_utils import _resolve_logging_exporters
 
-    # No credential name bound -> no destination, even with an OTEL callback set.
-    callback_obj = TeamCallbackMetadata(
-        success_callback=["langfuse_otel"], callback_vars={}
+    destinations, backends = await _resolve_logging_exporters(_auth())
+    assert destinations == [] and backends == []
+
+
+@pytest.mark.asyncio
+async def test_resolve_logging_exporters_skips_unknown_and_provider_creds(
+    _seeded_logging_credentials,
+):
+    from litellm.proxy.litellm_pre_call_utils import _resolve_logging_exporters
+
+    # unknown name + a provider credential (not credential_type=logging) -> nothing
+    destinations, backends = await _resolve_logging_exporters(
+        _auth(team_exporters=["does-not-exist", "openai-key"])
     )
-    assert _resolve_admin_otel_destination(callback_obj) is None
+    assert destinations == [] and backends == []
 
-    # Bound name but no OTEL v2 callback configured -> no destination.
-    callback_obj = TeamCallbackMetadata(
-        success_callback=["langsmith"],
-        callback_vars={"litellm_logging_credential_name": "langfuse-eu"},
+
+@pytest.mark.asyncio
+async def test_apply_admin_logging_exporters_stamps_and_activates(
+    _seeded_logging_credentials,
+):
+    from litellm.proxy.litellm_pre_call_utils import _apply_admin_logging_exporters
+
+    data: dict = {}
+    await _apply_admin_logging_exporters(data, _auth(team_exporters=["langfuse-eu"]))
+
+    assert data["otel_destinations"][0]["callback_name"] == "langfuse_otel"
+    assert (
+        data["otel_destinations"][0]["endpoint"]
+        == "https://cloud.langfuse.com/api/public/otel"
     )
-    assert _resolve_admin_otel_destination(callback_obj) is None
-
-
-def test_resolve_admin_otel_destination_unknown_credential_is_none():
-    from litellm.proxy.litellm_pre_call_utils import _resolve_admin_otel_destination
-
-    callback_obj = TeamCallbackMetadata(
-        success_callback=["langfuse_otel"],
-        callback_vars={"litellm_logging_credential_name": "does-not-exist"},
-    )
-    assert _resolve_admin_otel_destination(callback_obj) is None
+    # the backend is activated for the request
+    assert "langfuse_otel" in data["success_callback"]
