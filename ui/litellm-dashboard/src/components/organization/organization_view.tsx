@@ -12,6 +12,7 @@ import React, { useMemo, useState } from "react";
 import MemberTable from "../common_components/MemberTable";
 import UserSearchModal from "../common_components/user_search_modal";
 import MCPServerSelector from "../mcp_server_management/MCPServerSelector";
+import LoggingExportersSelect from "../logging_credentials/LoggingExportersSelect";
 import { ModelSelect } from "../ModelSelect/ModelSelect";
 import NotificationsManager from "../molecules/notifications_manager";
 import {
@@ -134,7 +135,12 @@ const OrganizationInfoView: React.FC<OrganizationInfoProps> = ({
           max_budget: values.max_budget,
           budget_duration: values.budget_duration,
         },
-        metadata: values.metadata ? JSON.parse(values.metadata) : null,
+        metadata: {
+          ...(values.metadata ? JSON.parse(values.metadata) : {}),
+          ...(values.logging_exporters !== undefined
+            ? { logging_exporters: values.logging_exporters }
+            : {}),
+        },
       };
 
       // Handle object_permission updates
@@ -366,6 +372,7 @@ const OrganizationInfoView: React.FC<OrganizationInfoProps> = ({
                       max_budget: orgData.litellm_budget_table.max_budget,
                       budget_duration: orgData.litellm_budget_table.budget_duration,
                       metadata: orgData.metadata ? JSON.stringify(orgData.metadata, null, 2) : "",
+                      logging_exporters: orgData.metadata?.logging_exporters || [],
                       vector_stores: orgData.object_permission?.vector_stores || [],
                       mcp_servers_and_groups: {
                         servers: orgData.object_permission?.mcp_servers || [],
@@ -435,6 +442,14 @@ const OrganizationInfoView: React.FC<OrganizationInfoProps> = ({
                         accessToken={accessToken || ""}
                         placeholder="Select MCP servers and access groups"
                       />
+                    </Form.Item>
+
+                    <Form.Item
+                      label="Logging Exporters"
+                      name="logging_exporters"
+                      tooltip="Admin-owned trace destinations every team in this org exports to (added to each key's and team's). Manage destinations under Settings -> Logging Credentials."
+                    >
+                      <LoggingExportersSelect />
                     </Form.Item>
 
                     <Form.Item label="Metadata" name="metadata">

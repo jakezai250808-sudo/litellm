@@ -14,12 +14,10 @@ export const CALLBACK_CONFIGS: CallbackConfig[] = [
     id: "arize",
     displayName: "Arize",
     logo: `${asset_logos_folder}arize.png`,
-    supports_key_team_logging: true,
-    // Admin-owned destination: bind a named credential (space_id + api_key live in the
-    // registry) rather than typing keys into the request path.
-    dynamic_params: {
-      litellm_logging_credential_name: "credential",
-    },
+    // OTEL v2 destination: assigned per identity via the "Logging Exporters" field
+    // (metadata.logging_exporters), not configured as a per-team callback here.
+    supports_key_team_logging: false,
+    dynamic_params: {},
     description: "Arize Logging Integration",
   },
   {
@@ -97,24 +95,20 @@ export const CALLBACK_CONFIGS: CallbackConfig[] = [
     id: "langfuse_otel",
     displayName: "Langfuse OTEL",
     logo: `${asset_logos_folder}langfuse.png`,
-    supports_key_team_logging: true,
-    // The destination is admin-owned: bind a named credential (host + keys live
-    // in the LLM Credentials registry) instead of typing keys into the request path.
-    dynamic_params: {
-      litellm_logging_credential_name: "credential",
-    },
+    // OTEL v2 destination: assigned per identity via the "Logging Exporters" field
+    // (metadata.logging_exporters), not configured as a per-team callback here.
+    supports_key_team_logging: false,
+    dynamic_params: {},
     description: "Langfuse v3 OTEL Logging Integration",
   },
   {
     id: "weave_otel",
     displayName: "Weave OTEL",
     logo: `${asset_logos_folder}weave.png`,
-    supports_key_team_logging: true,
-    // Admin-owned destination: bind a named credential (W&B key + endpoint live in the
-    // registry) rather than typing keys into the request path.
-    dynamic_params: {
-      litellm_logging_credential_name: "credential",
-    },
+    // OTEL v2 destination: assigned per identity via the "Logging Exporters" field
+    // (metadata.logging_exporters), not configured as a per-team callback here.
+    supports_key_team_logging: false,
+    dynamic_params: {},
     description: "Weave (W&B) OTEL Logging Integration",
   },
   {
