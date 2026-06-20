@@ -51,6 +51,7 @@ import NumericalInput from "../shared/numerical_input";
 import VectorStoreSelector from "../vector_store_management/VectorStoreSelector";
 import SearchToolSelector from "../SearchTools/SearchToolSelector";
 import EditLoggingSettings from "./EditLoggingSettings";
+import LoggingExportersSelect from "../logging_credentials/LoggingExportersSelect";
 import RouterSettingsAccordion, { RouterSettingsAccordionRef } from "../common_components/RouterSettingsAccordion";
 import MemberModal from "./EditMembership";
 import MemberPermissions from "./member_permissions";
@@ -530,6 +531,9 @@ const TeamInfoView: React.FC<TeamInfoProps> = ({
           guardrails: (values.guardrails || []).filter((n: string) => !globalGuardrailNames.has(n)),
           opted_out_global_guardrails: optedOutGlobalGuardrails,
           ...(values.logging_settings?.length > 0 ? { logging: values.logging_settings } : {}),
+          ...(values.logging_exporters !== undefined
+            ? { logging_exporters: values.logging_exporters }
+            : {}),
           disable_global_guardrails: killSwitchOnAtSave,
           soft_budget_alerting_emails:
             typeof values.soft_budget_alerting_emails === "string"
@@ -974,6 +978,7 @@ const TeamInfoView: React.FC<TeamInfoProps> = ({
                           )
                         : "",
                       logging_settings: info.metadata?.logging || [],
+                      logging_exporters: info.metadata?.logging_exporters || [],
                       secret_manager_settings: info.metadata?.secret_manager_settings
                         ? JSON.stringify(info.metadata.secret_manager_settings, null, 2)
                         : "",
@@ -1423,6 +1428,14 @@ const TeamInfoView: React.FC<TeamInfoProps> = ({
                           label: org.organization_alias || org.organization_id,
                         }))}
                       />
+                    </Form.Item>
+
+                    <Form.Item
+                      label="Logging Exporters"
+                      name="logging_exporters"
+                      tooltip="Admin-owned trace destinations this team exports to. Resolved server-side and fanned out (added to the key's and org's). Manage destinations under Settings -> Logging Credentials."
+                    >
+                      <LoggingExportersSelect />
                     </Form.Item>
 
                     <Form.Item label="Logging Settings" name="logging_settings">
