@@ -83,6 +83,8 @@ _ENABLE_TEAM_STALE_ALIAS_BYPASS: Optional[bool] = None
 
 
 if TYPE_CHECKING:
+    from litellm.integrations.otel.model.destination import OtelDestination
+    from litellm.models.credentials import CredentialItem
     from litellm.proxy.proxy_server import ProxyConfig as _ProxyConfig
     from litellm.types.proxy.policy_engine import PolicyMatchContext
 
@@ -583,54 +585,84 @@ async def _union_logging_exporter_names(user_api_key_dict: UserAPIKeyAuth) -> se
     return names
 
 
+def _access_matches(access: Any, team_id: Optional[str], org_id: Optional[str]) -> bool:
+    """Whether an admin-owned destination's ``access`` grants this caller.
+
+    ``global`` reaches everyone; otherwise the caller's team or org must be listed.
+    Per-key access is intentionally absent: a key's token rotates on regenerate, so
+    per-key assignment lives on the key's own ``logging_exporters`` instead.
+    """
+    if not isinstance(access, dict):
+        return False
+    if access.get("global") is True:
+        return True
+    teams = access.get("teams")
+    if team_id is not None and isinstance(teams, (list, tuple)) and team_id in teams:
+        return True
+    orgs = access.get("orgs")
+    return org_id is not None and isinstance(orgs, (list, tuple)) and org_id in orgs
+
+
 async def _resolve_logging_exporters(
     user_api_key_dict: UserAPIKeyAuth,
 ) -> "tuple[list, list]":
-    """Resolve the identity chain's assigned exporter names to (destinations, backends).
+    """Resolve the destinations this request fans out to, as (destinations, backends).
 
-    Each name is looked up in the admin-owned credential registry (must be a logging
-    credential); its backend comes from ``credential_info.description`` and its
-    destination from ``build_destination``. Destinations are deduped on (endpoint,
-    headers). The request never names or supplies a destination. Returns ([], []) when
-    nothing is assigned.
+    The selected set is the union of the identity chain's assigned exporter names
+    (key + team + org ``logging_exporters``) and every admin-owned logging destination
+    whose ``credential_info.access`` matches the caller (global, or the caller's team
+    or org). Each survivor is built via ``build_destination`` and deduped on (endpoint,
+    headers). The request never names or supplies a destination. Returns ([], []) only
+    when nothing is selected (default-deny).
     """
     from litellm.integrations.otel.destinations import build_destination
 
     names = await _union_logging_exporter_names(user_api_key_dict)
-    if not names:
-        return [], []
-    destinations: list = []
-    backends: list = []
-    seen: set = set()
-    for credential in litellm.credential_list:
-        if credential.credential_name not in names:
-            continue
+    team_id, org_id = user_api_key_dict.team_id, user_api_key_dict.org_id
+
+    def _selected(credential: "CredentialItem") -> bool:
         info = credential.credential_info or {}
         if info.get("credential_type") != "logging":
-            continue
-        backend = info.get("description")
+            return False
+        if credential.credential_name in names:
+            return True
+        return _access_matches(info.get("access"), team_id, org_id)
+
+    def _build(
+        credential: "CredentialItem",
+    ) -> "Optional[tuple[str, OtelDestination]]":
+        backend = (credential.credential_info or {}).get("description")
         if not backend:
-            continue
+            return None
         values = {
             str(key): str(value)
             for key, value in (credential.credential_values or {}).items()
         }
         destination = build_destination(backend, values)
-        if destination is None:
-            continue
-        identity = (destination.endpoint, tuple(sorted(destination.headers.items())))
-        if identity in seen:
-            continue
-        seen.add(identity)
-        destinations.append(
-            {
-                "callback_name": backend,
-                "endpoint": destination.endpoint,
-                "headers": destination.headers,
-            }
+        return None if destination is None else (backend, destination)
+
+    built = tuple(
+        result
+        for credential in litellm.credential_list
+        if _selected(credential)
+        if (result := _build(credential)) is not None
+    )
+    deduped = {
+        (destination.endpoint, tuple(sorted(destination.headers.items()))): (
+            backend,
+            destination,
         )
-        if backend not in backends:
-            backends.append(backend)
+        for backend, destination in built
+    }
+    destinations = [
+        {
+            "callback_name": backend,
+            "endpoint": destination.endpoint,
+            "headers": destination.headers,
+        }
+        for backend, destination in deduped.values()
+    ]
+    backends = list(dict.fromkeys(backend for backend, _ in deduped.values()))
     return destinations, backends
 
 

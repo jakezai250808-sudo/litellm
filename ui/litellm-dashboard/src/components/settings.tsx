@@ -29,9 +29,9 @@ const { Title, Paragraph } = Typography;
 import FormItem from "antd/es/form/FormItem";
 import AlertingSettings from "./alerting/alerting_settings";
 import CloudZeroCostTracking from "./CloudZeroCostTracking/CloudZeroCostTracking";
-import LoggingCredentialsPanel from "./logging_credentials/LoggingCredentialsPanel";
 import DeleteResourceModal from "./common_components/DeleteResourceModal";
 import {
+  credentialDeleteCall,
   deleteCallback,
   getCallbackConfigsCall,
   getCallbacksCall,
@@ -39,7 +39,11 @@ import {
   setCallbacksCall,
 } from "./networking";
 import { LoggingCallbacksTable } from "./Settings/LoggingAndAlerts/LoggingCallbacks/LoggingCallbacksTable";
-import { AlertingObject } from "./Settings/LoggingAndAlerts/LoggingCallbacks/types";
+import { AlertingObject, CredentialAccess } from "./Settings/LoggingAndAlerts/LoggingCallbacks/types";
+import { useCredentials } from "@/app/(dashboard)/hooks/credentials/useCredentials";
+import EditLoggingCredentialModal from "./logging_credentials/EditLoggingCredentialModal";
+import UnifiedAddLoggingModal from "./logging_credentials/UnifiedAddLoggingModal";
+import { backendLabel } from "./logging_credentials/loggingCredentialApi";
 import { parseErrorMessage } from "./shared/errorUtils";
 interface SettingsPageProps {
   accessToken: string | null;
@@ -247,6 +251,35 @@ const Settings: React.FC<SettingsPageProps> = ({ accessToken, userRole, userID, 
   const [isUpdatingCallback, setIsUpdatingCallback] = useState(false);
   const [isAddingCallback, setIsAddingCallback] = useState(false);
   const [isDeletingCallback, setIsDeletingCallback] = useState(false);
+
+  // OTEL trace destinations are credentials tagged credential_type=logging; they share
+  // the one Active Logging Callbacks table as rows alongside config callbacks.
+  const { data: credentialData, refetch: refetchCredentials } = useCredentials();
+  const [showUnifiedAdd, setShowUnifiedAdd] = useState(false);
+  const [editAccessFor, setEditAccessFor] = useState<{ name: string; access?: CredentialAccess } | null>(null);
+
+  const destinationRows: AlertingObject[] = (credentialData?.credentials ?? [])
+    .filter((c) => c.credential_info?.credential_type === "logging")
+    .map((c) => ({
+      name: c.credential_name,
+      variables: {} as AlertingObject["variables"],
+      credentialName: c.credential_name,
+      destinationLabel: c.credential_info?.host
+        ? `${backendLabel(c.credential_info?.description)} · ${c.credential_info.host}`
+        : backendLabel(c.credential_info?.description),
+      access: c.credential_info?.access,
+    }));
+
+  const handleDeleteDestination = async (name: string) => {
+    if (!accessToken) return;
+    try {
+      await credentialDeleteCall(accessToken, name);
+      NotificationsManager.success("Logging destination deleted");
+      refetchCredentials();
+    } catch (error) {
+      NotificationsManager.fromBackend(parseErrorMessage(error));
+    }
+  };
 
   useEffect(() => {
     if (!accessToken) {
@@ -578,14 +611,19 @@ const Settings: React.FC<SettingsPageProps> = ({ accessToken, userRole, userID, 
           <TabPanels>
             <TabPanel>
               <LoggingCallbacksTable
-                callbacks={callbacks}
+                callbacks={[...callbacks, ...destinationRows]}
                 availableCallbacks={allCallbacks}
-                onAdd={() => setShowAddCallbacksModal(true)}
+                onAdd={() => setShowUnifiedAdd(true)}
                 onEdit={(cb) => {
                   setSelectedEditCallback(cb);
                   setShowEditCallback(true);
                 }}
-                onDelete={(cb) => handleDeleteCallback(cb)}
+                onEditAccess={(cb) =>
+                  cb.credentialName && setEditAccessFor({ name: cb.credentialName, access: cb.access })
+                }
+                onDelete={(cb) =>
+                  cb.credentialName ? handleDeleteDestination(cb.credentialName) : handleDeleteCallback(cb)
+                }
                 onTest={async (cb) => {
                   try {
                     await serviceHealthCheck(accessToken, cb.name);
@@ -595,9 +633,29 @@ const Settings: React.FC<SettingsPageProps> = ({ accessToken, userRole, userID, 
                   }
                 }}
               />
-              <div className="mt-8">
-                <LoggingCredentialsPanel />
-              </div>
+              {accessToken && (
+                <UnifiedAddLoggingModal
+                  accessToken={accessToken}
+                  open={showUnifiedAdd}
+                  onClose={() => setShowUnifiedAdd(false)}
+                  onCreated={() => refetchCredentials()}
+                  availableCallbacks={allCallbacks}
+                  onSelectConfigCallback={(id) => {
+                    handleSelectedCallbackChange(id);
+                    setShowAddCallbacksModal(true);
+                  }}
+                />
+              )}
+              {accessToken && (
+                <EditLoggingCredentialModal
+                  accessToken={accessToken}
+                  credentialName={editAccessFor?.name ?? null}
+                  access={editAccessFor?.access}
+                  open={editAccessFor != null}
+                  onClose={() => setEditAccessFor(null)}
+                  onSaved={() => refetchCredentials()}
+                />
+              )}
             </TabPanel>
             <TabPanel>
               <div className="p-8">

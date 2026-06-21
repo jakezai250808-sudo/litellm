@@ -16,6 +16,51 @@ from litellm.proxy._types import LitellmUserRoles, UserAPIKeyAuth
 LOGGING_EXPORTERS_KEY = "logging_exporters"
 
 
+def is_admin_gated_credential_info(credential_info: Optional[dict]) -> bool:
+    """Whether a credential write must be proxy-admin only.
+
+    True when the credential is a logging destination or carries an ``access`` grant,
+    since both control where other tenants' traces are exported.
+    """
+    if not isinstance(credential_info, dict):
+        return False
+    return (
+        credential_info.get("credential_type") == "logging"
+        or "access" in credential_info
+    )
+
+
+def validate_credential_access(credential_info: Optional[dict]) -> None:
+    """Validate ``credential_info.access`` shape when the write sets one.
+
+    No-op when ``access`` is absent. Otherwise it must be an object whose ``global`` (if
+    present) is a bool and whose ``teams``/``orgs`` (if present) are lists of strings.
+    Per-key access is intentionally unsupported on a destination.
+    """
+    if not isinstance(credential_info, dict) or "access" not in credential_info:
+        return
+    access = credential_info["access"]
+    if not isinstance(access, dict):
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail={"error": "credential_info.access must be an object"},
+        )
+    if "global" in access and not isinstance(access["global"], bool):
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail={"error": "access.global must be a boolean"},
+        )
+    for field in ("teams", "orgs"):
+        bucket = access.get(field)
+        if bucket is not None and not (
+            isinstance(bucket, list) and all(isinstance(item, str) for item in bucket)
+        ):
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail={"error": f"access.{field} must be a list of strings"},
+            )
+
+
 def _logging_credential_names() -> set:
     return {
         credential.credential_name

@@ -35,7 +35,7 @@ const LoggingExportersSelect: React.FC<LoggingExportersSelectProps> = ({ value, 
       options={options}
       style={{ width: "100%" }}
       optionFilterProp="label"
-      notFoundContent="No logging credentials. Add one under Settings -> Logging Credentials."
+      notFoundContent="No logging destinations. Add one under Settings -> Logging Callbacks."
     />
   );
 };

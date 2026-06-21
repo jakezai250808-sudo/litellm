@@ -12,6 +12,8 @@ import litellm
 from litellm.models.credentials import CredentialItem
 from litellm.proxy._types import LitellmUserRoles, UserAPIKeyAuth
 from litellm.proxy.management_endpoints.logging_exporter_validation import (
+    is_admin_gated_credential_info,
+    validate_credential_access,
     validate_logging_exporter_assignment,
 )
 
@@ -90,4 +92,45 @@ def test_non_list_is_rejected(_registry):
         validate_logging_exporter_assignment(
             {"logging_exporters": "langfuse-eu"}, _admin()
         )
+    assert exc.value.status_code == 400
+
+
+@pytest.mark.parametrize(
+    "credential_info, gated",
+    [
+        ({"credential_type": "logging"}, True),
+        ({"access": {"global": True}}, True),
+        ({"credential_type": "logging", "access": {"teams": ["t"]}}, True),
+        ({"custom_llm_provider": "openai"}, False),
+        ({}, False),
+        (None, False),
+    ],
+)
+def test_is_admin_gated_credential_info(credential_info, gated):
+    assert is_admin_gated_credential_info(credential_info) is gated
+
+
+def test_validate_credential_access_accepts_valid_object():
+    validate_credential_access(
+        {"access": {"global": False, "teams": ["t1", "t2"], "orgs": ["o1"]}}
+    )
+
+
+def test_validate_credential_access_noop_without_access():
+    validate_credential_access({"credential_type": "logging"})
+    validate_credential_access(None)
+
+
+@pytest.mark.parametrize(
+    "access",
+    [
+        5,  # not an object
+        {"global": "yes"},  # global must be bool
+        {"teams": "t1"},  # teams must be a list
+        {"orgs": [1, 2]},  # orgs must be strings
+    ],
+)
+def test_validate_credential_access_rejects_bad_shape(access):
+    with pytest.raises(HTTPException) as exc:
+        validate_credential_access({"access": access})
     assert exc.value.status_code == 400

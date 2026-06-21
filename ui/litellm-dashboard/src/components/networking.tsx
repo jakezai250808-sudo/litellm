@@ -214,6 +214,13 @@ export interface CredentialItem {
     credential_type?: string;
     // Non-secret destination host/endpoint, surfaced in the logging credentials list.
     host?: string;
+    // Admin-owned access grant for a logging destination: which identities its
+    // traces fan out to. global reaches everyone; teams/orgs list ids.
+    access?: {
+      global?: boolean;
+      teams?: string[];
+      orgs?: string[];
+    };
   };
 }
 

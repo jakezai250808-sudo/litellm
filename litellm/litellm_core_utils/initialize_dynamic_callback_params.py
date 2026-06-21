@@ -1,4 +1,4 @@
-from typing import Dict, List, Optional, cast
+from typing import Dict, Optional, cast
 
 from litellm.types.utils import OtelDestinationParams, StandardCallbackDynamicParams
 
@@ -116,7 +116,7 @@ def initialize_standard_callback_dynamic_params(
         otel_destinations = kwargs.get("otel_destinations")
         if isinstance(otel_destinations, list):
             standard_callback_dynamic_params["otel_destinations"] = cast(
-                "List[OtelDestinationParams]", otel_destinations
+                "list[OtelDestinationParams]", otel_destinations
             )
 
     return standard_callback_dynamic_params

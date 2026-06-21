@@ -4711,11 +4711,12 @@ def _seeded_logging_credentials():
         litellm.credential_list = original
 
 
-def _auth(team_exporters=None, token=None, org_id=None):
+def _auth(team_exporters=None, token=None, org_id=None, team_id=None):
     return UserAPIKeyAuth(
         api_key="hashed-key",
         token=token,
         org_id=org_id,
+        team_id=team_id,
         team_metadata=({"logging_exporters": team_exporters} if team_exporters else {}),
     )
 
@@ -4814,3 +4815,101 @@ async def test_apply_admin_logging_exporters_stamps_and_activates(
     )
     # the backend is activated for the request
     assert "langfuse_otel" in data["success_callback"]
+
+
+_LANGFUSE_ENDPOINT = "https://cloud.langfuse.com/api/public/otel"
+_ARIZE_ENDPOINT = "https://otlp.arize.com/v1"
+
+
+@pytest.fixture
+def _seeded_logging_credentials_with_access():
+    """Destinations whose access lives ON the credential (global/team/org), in
+    addition to a name-only destination assigned via the identity chain."""
+    from litellm.models.credentials import CredentialItem
+
+    original = litellm.credential_list
+    litellm.credential_list = [
+        CredentialItem(
+            credential_name="langfuse-eu",
+            credential_values={
+                "langfuse_host": "https://cloud.langfuse.com",
+                "langfuse_public_key": "pk-eu",
+                "langfuse_secret_key": "sk-eu",
+            },
+            credential_info={
+                "credential_type": "logging",
+                "description": "langfuse_otel",
+                "access": {"teams": ["team-eu"], "orgs": ["org-eu"]},
+            },
+        ),
+        CredentialItem(
+            credential_name="arize-global",
+            credential_values={"arize_space_id": "S", "arize_api_key": "K"},
+            credential_info={
+                "credential_type": "logging",
+                "description": "arize",
+                "access": {"global": True},
+            },
+        ),
+    ]
+    try:
+        yield
+    finally:
+        litellm.credential_list = original
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "auth_kwargs, expected_endpoints",
+    [
+        # access.global reaches an unassigned caller (no names at all). This case
+        # fails if the resolver early-returns on empty identity names.
+        pytest.param({}, {_ARIZE_ENDPOINT}, id="access-global-unassigned"),
+        # access.teams matches the caller's team_id (no identity names).
+        pytest.param(
+            {"team_id": "team-eu"},
+            {_ARIZE_ENDPOINT, _LANGFUSE_ENDPOINT},
+            id="access-team-match",
+        ),
+        # a different team gets only the global destination.
+        pytest.param(
+            {"team_id": "team-other"}, {_ARIZE_ENDPOINT}, id="access-team-mismatch"
+        ),
+        # access.orgs matches the caller's org_id.
+        pytest.param(
+            {"org_id": "org-eu"},
+            {_ARIZE_ENDPOINT, _LANGFUSE_ENDPOINT},
+            id="access-org-match",
+        ),
+        # identity name AND access point at the same destination -> deduped to one
+        # (plus the always-on global). team-eu reaches langfuse via BOTH paths.
+        pytest.param(
+            {"team_id": "team-eu", "team_exporters": ["langfuse-eu"]},
+            {_ARIZE_ENDPOINT, _LANGFUSE_ENDPOINT},
+            id="both-paths-deduped",
+        ),
+    ],
+)
+async def test_resolve_logging_exporters_access_matrix(
+    _seeded_logging_credentials_with_access, auth_kwargs, expected_endpoints
+):
+    from litellm.proxy.litellm_pre_call_utils import _resolve_logging_exporters
+
+    destinations, _ = await _resolve_logging_exporters(_auth(**auth_kwargs))
+    assert {d["endpoint"] for d in destinations} == expected_endpoints
+    # no duplicate destinations survive the union
+    assert len(destinations) == len(expected_endpoints)
+
+
+@pytest.mark.asyncio
+async def test_resolve_logging_exporters_access_default_deny(
+    _seeded_logging_credentials,
+):
+    """With no access grants and no identity assignment, nothing resolves -- the
+    global-access path must not invent a destination out of name-only creds."""
+    from litellm.proxy.litellm_pre_call_utils import _resolve_logging_exporters
+
+    destinations, backends = await _resolve_logging_exporters(
+        _auth(team_id="team-eu", org_id="org-eu")
+    )
+    assert destinations == [] and backends == []
