@@ -1,5 +1,5 @@
 import { describe, it, expect, vi, beforeAll, beforeEach } from "vitest";
-import { render, screen, waitFor } from "@testing-library/react";
+import { render, screen, waitFor, fireEvent } from "@testing-library/react";
 import { flexRender, getCoreRowModel, useReactTable } from "@tanstack/react-table";
 import PublicModelHub, { publicMCPHubColumns, MCPServerData } from "./public_model_hub";
 
@@ -244,6 +244,23 @@ describe("publicMCPHubColumns", () => {
 
   it("does not render the server url anywhere in the table", () => {
     render(<PublicMcpTestTable data={[mockMcpServer]} />);
+    expect(screen.queryByText(PUBLIC_SERVER_URL)).not.toBeInTheDocument();
+  });
+});
+
+describe("public hub MCP details modal", () => {
+  it("does not show the upstream url when a server is opened", async () => {
+    const networkingModule = await import("./networking");
+    vi.mocked(networkingModule.mcpHubPublicServersCall).mockResolvedValue([mockMcpServer]);
+
+    render(<PublicModelHub />);
+
+    fireEvent.click(await screen.findByRole("tab", { name: /MCP Hub/i }));
+    fireEvent.click(await screen.findByRole("button", { name: "exa_test" }));
+
+    // "Server Overview" only exists inside the opened MCP details modal,
+    // so finding it proves the modal rendered and the url assertion is not vacuous.
+    await screen.findByText("Server Overview");
     expect(screen.queryByText(PUBLIC_SERVER_URL)).not.toBeInTheDocument();
   });
 });
