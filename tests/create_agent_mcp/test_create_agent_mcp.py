@@ -57,6 +57,7 @@ class TestToolShape(unittest.TestCase):
             set(schema["inputSchema"]["required"]),
             {"purpose", "runtime_target"},
         )
+        self.assertFalse(schema["inputSchema"]["additionalProperties"])
 
     def test_list_tools(self):
         listing = list_tools()
@@ -194,22 +195,97 @@ class TestEntrypoint(unittest.TestCase):
         rc = __main__.main()
         self.assertEqual(rc, 2)
 
-    def test_decorated_tool_signature_has_no_machine_id(self):
-        # The gateway derives the public tool schema from the decorated
-        # create_agent function signature (deploy contract). machine_id must NOT
-        # be a parameter — machine placement is owned by the Runtime Placement
-        # gate (#907), not the caller.
+    def test_decorated_tool_signature_catches_machine_id_without_requiring_it(self):
+        # The advertised schema omits machine_id, but the decorated function keeps
+        # an optional hidden catch so raw REST/MCP callers get a structured
+        # fail-closed response with request_id instead of FastMCP silently
+        # dropping the field. Machine placement is still owned by #907.
         from create_agent_mcp import __main__
 
         sig = __main__.create_agent_signature()
         params = set(sig.parameters.keys())
-        self.assertEqual(params, {"purpose", "runtime_target", "allow_live_create"})
-        self.assertNotIn("machine_id", params)
+        self.assertEqual(
+            params,
+            {"purpose", "runtime_target", "allow_live_create", "machine_id"},
+        )
+        self.assertIsNot(sig.parameters["machine_id"].default, inspect.Parameter.empty)
         # required (no default) params are the public required fields
         required = {
             name for name, p in sig.parameters.items() if p.default is inspect.Parameter.empty
         }
         self.assertEqual(required, {"purpose", "runtime_target"})
+
+    def test_strict_tool_args_hide_machine_id_and_reject_other_unknown_fields(self):
+        # FastMCP's generated pydantic arg model defaults to ignoring unknown
+        # keys. The entrypoint tightens that to fail-closed so raw REST/MCP
+        # callers cannot smuggle unexpected fields. machine_id is intentionally
+        # accepted by the hidden runtime signature only so validate_create_intent
+        # can reject it with a request_id.
+        try:
+            from pydantic import BaseModel, create_model
+        except ImportError:
+            self.skipTest("pydantic is required for FastMCP strict-args test")
+        from create_agent_mcp import __main__
+
+        class ArgBase(BaseModel):
+            def model_dump_one_level(self):
+                return self.model_dump()
+
+        arg_model = create_model(
+            "CreateAgentArgs",
+            __base__=ArgBase,
+            purpose=(str, ...),
+            runtime_target=(str, ...),
+            allow_live_create=(bool, False),
+            machine_id=(str | None, None),
+        )
+
+        class FakeMetadata:
+            pass
+
+        class FakeTool:
+            pass
+
+        class FakeToolManager:
+            def __init__(self, tool):
+                self.tool = tool
+
+            def get_tool(self, name):
+                return self.tool if name == TOOL_NAME else None
+
+        class FakeMCP:
+            pass
+
+        metadata = FakeMetadata()
+        metadata.arg_model = arg_model
+        tool = FakeTool()
+        tool.fn_metadata = metadata
+        tool.parameters = {}
+        mcp = FakeMCP()
+        mcp._tool_manager = FakeToolManager(tool)
+
+        advertised_schema = tool_schema()["inputSchema"]
+        __main__._enforce_strict_tool_args(mcp, TOOL_NAME, advertised_schema)
+
+        self.assertIsNotNone(
+            arg_model.model_validate(
+                {
+                    "purpose": "p",
+                    "runtime_target": "r",
+                    "machine_id": "m-test",
+                }
+            )
+        )
+        with self.assertRaises(Exception):
+            arg_model.model_validate(
+                {
+                    "purpose": "p",
+                    "runtime_target": "r",
+                    "unexpected": "must-fail",
+                }
+            )
+        self.assertNotIn("machine_id", tool.parameters.get("properties", {}))
+        self.assertFalse(tool.parameters.get("additionalProperties", True))
 
 
 class TestRegistryIdentity(unittest.TestCase):
