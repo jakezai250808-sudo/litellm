@@ -198,6 +198,7 @@ def tool_schema() -> Dict[str, Any]:
         ),
         "inputSchema": {
             "type": "object",
+            "additionalProperties": False,
             "properties": {
                 "purpose": {"type": "string", "description": "Short create intent / reason."},
                 "runtime_target": {"type": "string", "description": "Target runtime/service slug."},
