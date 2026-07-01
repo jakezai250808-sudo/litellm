@@ -47,18 +47,21 @@ def main() -> int:
         purpose: str,
         runtime_target: str,
         allow_live_create: bool = False,
+        **kwargs: str,
     ) -> str:
         """Gateway-side create_agent (dry-run only). Returns a plan + request_id."""
-        return _to_mcp_text(
-            call_tool(
-                TOOL_NAME,
-                {
-                    "purpose": purpose,
-                    "runtime_target": runtime_target,
-                    "allow_live_create": allow_live_create,
-                },
-            )
-        )
+        # Fail-closed: FastMCP silently drops unknown keyword args from the
+        # decorated function signature; **kwargs catches them so we can
+        # enforce the contract. Inject caller-supplied machine_id (if any) so
+        # validate_create_intent reject it — machine placement belongs to #907.
+        tool_args: dict = {
+            "purpose": purpose,
+            "runtime_target": runtime_target,
+            "allow_live_create": allow_live_create,
+        }
+        if "machine_id" in kwargs:
+            tool_args["machine_id"] = kwargs["machine_id"]
+        return _to_mcp_text(call_tool(TOOL_NAME, tool_args))
 
     # Expose tool metadata so gateway registry readback is consistent.
     mcp._tool_schema = tool_schema  # type: ignore[attr-defined]
