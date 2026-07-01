@@ -36,8 +36,12 @@ ACCESS_GROUP = "agent-create-dryrun"
 TOOL_NAME = "create_agent"
 ALLOW_ALL_KEYS = False
 
-# Required fields for a create intent. Keeping this minimal per the handoff doc.
-REQUIRED_FIELDS = ("purpose", "machine_id", "runtime_target")
+# Required fields for the public create_agent tool. Kept minimal and
+# owner-facing: the caller expresses intent (purpose + runtime_target) only.
+# Machine placement / binding is NOT caller-supplied at the Gateway tool
+# boundary — it belongs to the Runtime Placement gate (task #907) under owner GO.
+# A caller-supplied machine_id is rejected (see validate_create_intent).
+PUBLIC_REQUIRED_FIELDS = ("purpose", "runtime_target")
 
 # Fail-closed: this phase NEVER performs live create, even if the caller asks.
 LIVE_CREATE_DISABLED = True
@@ -112,8 +116,10 @@ def validate_create_intent(args: Dict[str, Any]) -> Tuple[bool, Optional[str], D
     """Validate a create_agent tool-call argument dict.
 
     Returns (ok, blocked_reason_or_none, candidate_refs).
-    Fail-closed on: missing required fields, allow_live_create=true,
-    missing/empty machine_id, or any secret-shaped value in the args.
+    Fail-closed on: missing required public fields, a caller-supplied
+    machine_id (machine placement is not exposed at the Gateway tool boundary —
+    it belongs to the Runtime Placement gate, task #907), allow_live_create=true,
+    or any secret-shaped value in the args.
     """
     if not isinstance(args, dict):
         return False, "args must be a JSON object", {}
@@ -122,19 +128,19 @@ def validate_create_intent(args: Dict[str, Any]) -> Tuple[bool, Optional[str], D
     if _deep_secret_scan(args):
         return False, "args contain secret-shaped value(s)", {}
 
-    # Required fields presence + non-empty.
-    for field in REQUIRED_FIELDS:
+    # Required public fields presence + non-empty.
+    for field in PUBLIC_REQUIRED_FIELDS:
         val = args.get(field)
         if val is None or (isinstance(val, str) and not val.strip()):
             return False, f"missing required field: {field}", {}
 
-    machine_id = str(args["machine_id"]).strip()
     purpose = str(args["purpose"]).strip()
     runtime_target = str(args["runtime_target"]).strip()
 
-    # machine_id shape (no traversal / no secret). Must start with a letter.
-    if not re.match(r"^[A-Za-z][A-Za-z0-9_.\-]{1,127}$", machine_id):
-        return False, "machine_id has unsafe shape", {}
+    # Caller-supplied machine_id is NOT accepted at the Gateway tool boundary.
+    # Machine selection / binding happens under the Runtime Placement gate (#907).
+    if args.get("machine_id") not in (None, ""):
+        return False, "caller-supplied machine_id is not allowed at the Gateway tool boundary (machine placement is Runtime Placement gate, task #907)", {}
 
     # Live create is fail-closed in this phase.
     if args.get("allow_live_create") in (True, "true", "True", "1", 1):
@@ -142,7 +148,6 @@ def validate_create_intent(args: Dict[str, Any]) -> Tuple[bool, Optional[str], D
             return False, "allow_live_create requires a separate owner GO + Runtime Placement gate (not available in this phase)", {}
 
     candidate_refs = {
-        "machine_id": machine_id,
         "runtime_target": runtime_target,
         "purpose": purpose[:120],
     }
@@ -177,7 +182,13 @@ def create_agent(args: Dict[str, Any]) -> CreateResult:
 
 
 def tool_schema() -> Dict[str, Any]:
-    """MCP tool definition exposed to the gateway registry."""
+    """MCP tool definition exposed to the gateway registry.
+
+    The public schema is owner-facing and minimal: the caller expresses intent
+    (purpose + runtime_target) only. machine placement / binding is NOT exposed
+    at the Gateway tool boundary — it belongs to the Runtime Placement gate
+    (task #907) under owner GO. A caller-supplied machine_id is rejected.
+    """
     return {
         "name": TOOL_NAME,
         "description": (
@@ -189,7 +200,6 @@ def tool_schema() -> Dict[str, Any]:
             "type": "object",
             "properties": {
                 "purpose": {"type": "string", "description": "Short create intent / reason."},
-                "machine_id": {"type": "string", "description": "Target machine identifier."},
                 "runtime_target": {"type": "string", "description": "Target runtime/service slug."},
                 "allow_live_create": {
                     "type": "boolean",
@@ -197,7 +207,7 @@ def tool_schema() -> Dict[str, Any]:
                     "description": "Fail-closed in this phase; always rejected.",
                 },
             },
-            "required": ["purpose", "machine_id", "runtime_target"],
+            "required": ["purpose", "runtime_target"],
         },
     }
 

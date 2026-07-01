@@ -48,11 +48,13 @@ class TestToolShape(unittest.TestCase):
         schema = tool_schema()
         self.assertEqual(schema["name"], TOOL_NAME)
         props = schema["inputSchema"]["properties"]
-        for field in ("purpose", "machine_id", "runtime_target", "allow_live_create"):
+        for field in ("purpose", "runtime_target", "allow_live_create"):
             self.assertIn(field, props)
+        # machine_id must NOT be in the public schema
+        self.assertNotIn("machine_id", props)
         self.assertEqual(
             set(schema["inputSchema"]["required"]),
-            {"purpose", "machine_id", "runtime_target"},
+            {"purpose", "runtime_target"},
         )
 
     def test_list_tools(self):
@@ -66,7 +68,6 @@ class TestDryRunSuccess(unittest.TestCase):
         result = create_agent(
             {
                 "purpose": "onboard infra-fix throwaway",
-                "machine_id": "ip-172-31-58-63",
                 "runtime_target": "infra-e2e-codex-1017",
             }
         )
@@ -76,12 +77,12 @@ class TestDryRunSuccess(unittest.TestCase):
         self.assertTrue(result.no_change)
         self.assertIsNone(result.blocked_reason)
         self.assertTrue(result.request_id.startswith("req-"))
-        self.assertEqual(result.candidate_refs["machine_id"], "ip-172-31-58-63")
+        self.assertNotIn("machine_id", result.candidate_refs)
         self.assertEqual(result.candidate_refs["runtime_target"], "infra-e2e-codex-1017")
 
     def test_each_call_gets_fresh_request_id(self):
-        a = create_agent({"purpose": "x", "machine_id": "m-1", "runtime_target": "r"})
-        b = create_agent({"purpose": "x", "machine_id": "m-1", "runtime_target": "r"})
+        a = create_agent({"purpose": "x", "runtime_target": "r"})
+        b = create_agent({"purpose": "x", "runtime_target": "r"})
         self.assertNotEqual(a.request_id, b.request_id)
 
 
@@ -96,39 +97,30 @@ class TestFailClosed(unittest.TestCase):
             self.assertIn(reason_fragment, result.blocked_reason)
 
     def test_missing_purpose(self):
-        self._expect_blocked({"machine_id": "m-1", "runtime_target": "r"}, "purpose")
-
-    def test_missing_machine_id(self):
-        self._expect_blocked({"purpose": "p", "runtime_target": "r"}, "machine_id")
+        self._expect_blocked({"runtime_target": "r"}, "purpose")
 
     def test_missing_runtime_target(self):
-        self._expect_blocked({"purpose": "p", "machine_id": "m-1"}, "runtime_target")
+        self._expect_blocked({"purpose": "p"}, "runtime_target")
 
     def test_empty_string_field(self):
-        self._expect_blocked({"purpose": "  ", "machine_id": "m-1", "runtime_target": "r"})
+        self._expect_blocked({"purpose": "  ", "runtime_target": "r"})
+
+    def test_caller_supplied_machine_id_rejected(self):
+        self._expect_blocked(
+            {"purpose": "p", "runtime_target": "r", "machine_id": "ip-172-31-58-63"},
+            "machine_id",
+        )
 
     def test_allow_live_create_bool_rejected(self):
         self._expect_blocked(
-            {"purpose": "p", "machine_id": "m-1", "runtime_target": "r", "allow_live_create": True},
+            {"purpose": "p", "runtime_target": "r", "allow_live_create": True},
             "owner GO",
         )
 
     def test_allow_live_create_string_rejected(self):
         self._expect_blocked(
-            {"purpose": "p", "machine_id": "m-1", "runtime_target": "r", "allow_live_create": "true"},
+            {"purpose": "p", "runtime_target": "r", "allow_live_create": "true"},
             "owner GO",
-        )
-
-    def test_machine_id_unsafe_shape_rejected(self):
-        self._expect_blocked(
-            {"purpose": "p", "machine_id": "../escape", "runtime_target": "r"},
-            "machine_id",
-        )
-
-    def test_machine_id_leading_digit_rejected(self):
-        self._expect_blocked(
-            {"purpose": "p", "machine_id": "1bad", "runtime_target": "r"},
-            "machine_id",
         )
 
     def test_args_not_dict(self):
@@ -145,7 +137,7 @@ class TestFailClosed(unittest.TestCase):
 class TestNoSecretLeak(unittest.TestCase):
     def test_secret_shaped_arg_rejected(self):
         result = create_agent(
-            {"purpose": "sk-ant-secretvalue123", "machine_id": "m-1", "runtime_target": "r"}
+            {"purpose": "sk-ant-secretvalue123", "runtime_target": "r"}
         )
         self.assertFalse(result.ok)
         self.assertIn("secret", result.blocked_reason)
@@ -154,7 +146,6 @@ class TestNoSecretLeak(unittest.TestCase):
         result = create_agent(
             {
                 "purpose": "p",
-                "machine_id": "m-1",
                 "runtime_target": "r",
                 "extra": {"token": "gho_leakedtoken1234567"},
             }
@@ -164,7 +155,7 @@ class TestNoSecretLeak(unittest.TestCase):
     def test_output_never_contains_secret(self):
         # Even when args contain a secret, the result must not echo it.
         result = create_agent(
-            {"purpose": "p", "machine_id": "m-1", "runtime_target": "r", "leak": "AKIAIOSFODNN7EXAMPLE"}
+            {"purpose": "p", "runtime_target": "r", "leak": "AKIAIOSFODNN7EXAMPLE"}
         )
         serialized = json.dumps(result.to_dict(), sort_keys=True)
         self.assertNotIn("AKIAIOSFODNN7EXAMPLE", serialized)
@@ -177,7 +168,7 @@ class TestNoSecretLeak(unittest.TestCase):
 
     def test_slock_agent_token_rejected(self):
         result = create_agent(
-            {"purpose": "sk_agent_redactedtoken123", "machine_id": "m-1", "runtime_target": "r"}
+            {"purpose": "sk_agent_redactedtoken123", "runtime_target": "r"}
         )
         self.assertFalse(result.ok)
         self.assertIn("secret", result.blocked_reason)
@@ -185,7 +176,7 @@ class TestNoSecretLeak(unittest.TestCase):
 
     def test_slock_machine_token_rejected(self):
         result = create_agent(
-            {"purpose": "p", "machine_id": "m-1", "runtime_target": "sk_machine_redactedabcd"}
+            {"purpose": "p", "runtime_target": "sk_machine_redactedabcd"}
         )
         self.assertFalse(result.ok)
         self.assertNotIn("sk_machine_redactedabcd", json.dumps(result.to_dict()))
