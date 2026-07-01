@@ -1,0 +1,24 @@
+# LiteLLM Gateway MCP registry entry for the create_agent upstream.
+#
+# This is the deployable registration that turns the standalone create_agent MCP
+# upstream (create_agent_mcp/server.py) into a gateway-managed tool. Deploy by
+# applying this server block to the LiteLLM Gateway config (mcp_servers) and
+# binding it to the access group below.
+#
+# Boundary: allow_all_keys=false; only the named access group may call the tool.
+# No model router / provider key / account state changes.
+
+server_name: create-agent-dryrun-local
+access_group: agent-create-dryrun
+allowed_tools:
+  - create_agent
+allow_all_keys: false
+transport: stdio
+command: python
+args:
+  - -m
+  - create_agent_mcp
+description: >
+  Gateway-side create_agent (dry-run only). Returns a plan + request_id;
+  performs no live create/bind/start. Live create requires a separate owner
+  GO + Runtime Placement gate.
