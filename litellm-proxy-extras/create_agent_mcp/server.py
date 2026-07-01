@@ -18,7 +18,7 @@ Boundary (A段 / dry-run only):
   echoed.
 
 This module is import-safe (no side effects on import). Run as a process via
-``python -m create_agent_mcp.server`` (see ``__main__.py``).
+``python -m create_agent_mcp`` (see ``__main__.py``).
 """
 
 from __future__ import annotations

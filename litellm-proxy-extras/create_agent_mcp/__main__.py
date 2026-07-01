@@ -1,11 +1,17 @@
 """Run the create_agent MCP upstream as a stdio MCP server process.
 
 Usage:
-    python -m create_agent_mcp.server
+    python -m create_agent_mcp
 
 The MCP Python SDK (``mcp`` package, already a LiteLLM dependency) provides the
 stdio transport. The gateway registers this process via ``registry.yaml`` and
 calls ``tools/list`` + ``tools/call`` over stdio.
+
+The decorated ``create_agent`` tool signature below is the deploy contract: the
+gateway derives the public tool schema from it. It intentionally exposes ONLY
+``purpose`` + ``runtime_target`` (+ the always-rejected ``allow_live_create``).
+``machine_id`` is NOT a parameter — machine placement / binding is owned by the
+Runtime Placement gate (task #907), not the caller.
 
 This entry point only runs when executed as a process; importing the package or
 ``server`` module has no side effects.
@@ -13,6 +19,7 @@ This entry point only runs when executed as a process; importing the package or
 
 from __future__ import annotations
 
+import inspect
 import sys
 from typing import Any, Dict
 
@@ -38,7 +45,6 @@ def main() -> int:
     @mcp.tool()
     def create_agent(  # noqa: D401 - MCP tool
         purpose: str,
-        machine_id: str,
         runtime_target: str,
         allow_live_create: bool = False,
     ) -> str:
@@ -48,7 +54,6 @@ def main() -> int:
                 TOOL_NAME,
                 {
                     "purpose": purpose,
-                    "machine_id": machine_id,
                     "runtime_target": runtime_target,
                     "allow_live_create": allow_live_create,
                 },
@@ -63,5 +68,23 @@ def main() -> int:
     return 0
 
 
+def create_agent_signature() -> inspect.Signature:
+    """Return the signature of the decorated create_agent tool.
+
+    Used by tests to assert the deploy contract (no machine_id parameter)
+    without requiring the mcp SDK to be installed.
+    """
+    def _create_agent(
+        purpose: str,
+        runtime_target: str,
+        allow_live_create: bool = False,
+    ) -> str:
+        del purpose, runtime_target, allow_live_create  # signature-only stub
+        return ""
+
+    return inspect.signature(_create_agent)
+
+
 if __name__ == "__main__":
     raise SystemExit(main())
+

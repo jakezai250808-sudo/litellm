@@ -14,6 +14,7 @@ Covers (per @Ops-new review checklist):
 from __future__ import annotations
 
 import json
+import inspect
 import os
 import sys
 import unittest
@@ -192,6 +193,23 @@ class TestEntrypoint(unittest.TestCase):
         self.assertTrue(callable(__main__.main))
         rc = __main__.main()
         self.assertEqual(rc, 2)
+
+    def test_decorated_tool_signature_has_no_machine_id(self):
+        # The gateway derives the public tool schema from the decorated
+        # create_agent function signature (deploy contract). machine_id must NOT
+        # be a parameter — machine placement is owned by the Runtime Placement
+        # gate (#907), not the caller.
+        from create_agent_mcp import __main__
+
+        sig = __main__.create_agent_signature()
+        params = set(sig.parameters.keys())
+        self.assertEqual(params, {"purpose", "runtime_target", "allow_live_create"})
+        self.assertNotIn("machine_id", params)
+        # required (no default) params are the public required fields
+        required = {
+            name for name, p in sig.parameters.items() if p.default is inspect.Parameter.empty
+        }
+        self.assertEqual(required, {"purpose", "runtime_target"})
 
 
 class TestRegistryIdentity(unittest.TestCase):
