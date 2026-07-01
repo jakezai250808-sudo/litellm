@@ -46,6 +46,7 @@ LIVE_CREATE_DISABLED = True
 # value matching these is rejected / redacted before emission.
 SECRET_SHAPE_PATTERNS = (
     re.compile(r"sk-[A-Za-z0-9_\-]{6,}"),
+    re.compile(r"sk_(?:agent|machine)_[A-Za-z0-9_\-]{6,}"),  # Slock agent/machine tokens
     re.compile(r"gh[opsu]_[A-Za-z0-9]{6,}"),
     re.compile(r"AKIA[0-9A-Z]{6,}"),
     re.compile(r"-----BEGIN [A-Z ]*PRIVATE KEY-----"),

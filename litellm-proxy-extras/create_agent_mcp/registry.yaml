@@ -17,7 +17,7 @@ transport: stdio
 command: python
 args:
   - -m
-  - create_agent_mcp.server
+  - create_agent_mcp
 description: >
   Gateway-side create_agent (dry-run only). Returns a plan + request_id;
   performs no live create/bind/start. Live create requires a separate owner

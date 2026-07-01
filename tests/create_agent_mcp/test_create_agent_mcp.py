@@ -175,6 +175,33 @@ class TestNoSecretLeak(unittest.TestCase):
         self.assertFalse(_deep_secret_scan("normal text"))
         self.assertFalse(_deep_secret_scan({"a": ["fine"]}))
 
+    def test_slock_agent_token_rejected(self):
+        result = create_agent(
+            {"purpose": "sk_agent_redactedtoken123", "machine_id": "m-1", "runtime_target": "r"}
+        )
+        self.assertFalse(result.ok)
+        self.assertIn("secret", result.blocked_reason)
+        self.assertNotIn("sk_agent_redactedtoken123", json.dumps(result.to_dict()))
+
+    def test_slock_machine_token_rejected(self):
+        result = create_agent(
+            {"purpose": "p", "machine_id": "m-1", "runtime_target": "sk_machine_redactedabcd"}
+        )
+        self.assertFalse(result.ok)
+        self.assertNotIn("sk_machine_redactedabcd", json.dumps(result.to_dict()))
+
+
+class TestEntrypoint(unittest.TestCase):
+    def test_main_is_callable_without_mcp(self):
+        # The registry runs `python -m create_agent_mcp` -> __main__.main().
+        # main() must be importable and callable; without the mcp SDK it returns 2
+        # cleanly (no crash). This proves the entrypoint resolves.
+        from create_agent_mcp import __main__
+
+        self.assertTrue(callable(__main__.main))
+        rc = __main__.main()
+        self.assertEqual(rc, 2)
+
 
 class TestRegistryIdentity(unittest.TestCase):
     def test_constants_match_registry_yaml(self):
