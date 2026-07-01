@@ -199,18 +199,20 @@ class TestEntrypoint(unittest.TestCase):
         # The gateway derives the public tool schema from the decorated
         # create_agent function signature (deploy contract). machine_id must NOT
         # be a parameter — machine placement is owned by the Runtime Placement
-        # gate (#907), not the caller.
+        # gate (#907), not the caller. mode= must be present with dry-run default.
         from create_agent_mcp import __main__
 
         sig = __main__.create_agent_signature()
         params = set(sig.parameters.keys())
-        self.assertEqual(params, {"purpose", "runtime_target", "allow_live_create"})
+        self.assertEqual(params, {"purpose", "runtime_target", "mode", "allow_live_create"})
         self.assertNotIn("machine_id", params)
         # required (no default) params are the public required fields
         required = {
             name for name, p in sig.parameters.items() if p.default is inspect.Parameter.empty
         }
         self.assertEqual(required, {"purpose", "runtime_target"})
+        # mode defaults to dry-run
+        self.assertEqual(sig.parameters["mode"].default, "dry-run")
 
 
 class TestRegistryIdentity(unittest.TestCase):
@@ -272,6 +274,21 @@ class TestLiveCreate(unittest.TestCase):
             {"purpose": "test", "runtime_target": "r"},
         )
         self.assertEqual(out["mode"], "dry-run")
+
+    def test_call_tool_unknown_mode_fail_closed(self):
+        out = call_tool(
+            "create_agent",
+            {"purpose": "test", "runtime_target": "r", "mode": "nonsense"},
+        )
+        self.assertFalse(out["ok"])
+        self.assertIn("unknown mode", out["blocked_reason"])
+
+    def test_tool_schema_has_mode_param(self):
+        schema = tool_schema()
+        props = schema["inputSchema"]["properties"]
+        self.assertIn("mode", props)
+        self.assertEqual(props["mode"]["enum"], ["dry-run", "live"])
+        self.assertEqual(props["mode"]["default"], "dry-run")
 
 
 if __name__ == "__main__":

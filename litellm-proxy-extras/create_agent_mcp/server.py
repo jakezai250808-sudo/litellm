@@ -234,15 +234,23 @@ def tool_schema() -> Dict[str, Any]:
     return {
         "name": TOOL_NAME,
         "description": (
-            "Gateway-side create_agent (dry-run only). Returns a plan + "
-            "request_id; performs no live create/bind/start. Live create "
-            "requires a separate owner GO + Runtime Placement gate."
+            "Gateway-side create_agent. Returns a plan + request_id. "
+            "mode=dry-run (default): no live create/bind/start. "
+            "mode=live: produces a liveCreateCard for execution under "
+            "owner GO + Runtime Placement gate (#907). Live card does "
+            "NOT execute the create itself."
         ),
         "inputSchema": {
             "type": "object",
             "properties": {
                 "purpose": {"type": "string", "description": "Short create intent / reason."},
                 "runtime_target": {"type": "string", "description": "Target runtime/service slug."},
+                "mode": {
+                    "type": "string",
+                    "enum": ["dry-run", "live"],
+                    "default": "dry-run",
+                    "description": "dry-run=plan only (default); live=produce liveCreateCard for #907 gate",
+                },
                 "allow_live_create": {
                     "type": "boolean",
                     "default": False,
@@ -272,6 +280,16 @@ def call_tool(name: str, arguments: Dict[str, Any]) -> Dict[str, Any]:
             candidate_refs={},
         ).to_dict()
     mode = arguments.get("mode", "dry-run")
+    if mode not in ("dry-run", "live"):
+        return CreateResult(
+            ok=False,
+            request_id=_new_request_id(),
+            mode=mode,
+            executed=False,
+            no_change=True,
+            blocked_reason=f"unknown mode: {mode!r} (valid: dry-run, live)",
+            candidate_refs={},
+        ).to_dict()
     if mode == "live":
         return create_agent_live(arguments).to_dict()
     return create_agent(arguments).to_dict()

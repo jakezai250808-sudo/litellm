@@ -46,15 +46,17 @@ def main() -> int:
     def create_agent(  # noqa: D401 - MCP tool
         purpose: str,
         runtime_target: str,
+        mode: str = "dry-run",
         allow_live_create: bool = False,
     ) -> str:
-        """Gateway-side create_agent (dry-run only). Returns a plan + request_id."""
+        """Gateway-side create_agent. mode=dry-run (default) or mode=live (#907 gate)."""
         return _to_mcp_text(
             call_tool(
                 TOOL_NAME,
                 {
                     "purpose": purpose,
                     "runtime_target": runtime_target,
+                    "mode": mode,
                     "allow_live_create": allow_live_create,
                 },
             )
@@ -77,9 +79,10 @@ def create_agent_signature() -> inspect.Signature:
     def _create_agent(
         purpose: str,
         runtime_target: str,
+        mode: str = "dry-run",
         allow_live_create: bool = False,
     ) -> str:
-        del purpose, runtime_target, allow_live_create  # signature-only stub
+        del purpose, runtime_target, mode, allow_live_create  # signature-only stub
         return ""
 
     return inspect.signature(_create_agent)
