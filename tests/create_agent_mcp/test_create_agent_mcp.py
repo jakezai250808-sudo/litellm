@@ -31,6 +31,7 @@ from create_agent_mcp import (  # noqa: E402
     TOOL_NAME,
     call_tool,
     create_agent,
+    create_agent_live,
     list_tools,
     tool_schema,
     validate_create_intent,
@@ -229,6 +230,48 @@ class TestRegistryIdentity(unittest.TestCase):
         self.assertEqual(data["access_group"], ACCESS_GROUP)
         self.assertEqual(data["allowed_tools"], [TOOL_NAME])
         self.assertFalse(data["allow_all_keys"])
+
+
+class TestLiveCreate(unittest.TestCase):
+    def test_live_create_returns_card_not_executed(self):
+        result = create_agent_live(
+            {"purpose": "onboard test agent", "runtime_target": "infra-agent"}
+        )
+        self.assertTrue(result.ok)
+        self.assertEqual(result.mode, "live")
+        self.assertFalse(result.executed)  # #907 executes, not this tool
+        self.assertTrue(result.no_change)
+        self.assertIsNone(result.blocked_reason)
+        self.assertIn("liveCreatePending", result.candidate_refs)
+        self.assertTrue(result.candidate_refs["liveCreatePending"] == "true")
+        self.assertIn("executionRequires", result.candidate_refs)
+
+    def test_live_create_invalid_rejected(self):
+        result = create_agent_live({"runtime_target": "r"})  # missing purpose
+        self.assertFalse(result.ok)
+        self.assertIn("purpose", result.blocked_reason)
+
+    def test_live_create_with_secret_rejected(self):
+        result = create_agent_live(
+            {"purpose": "sk-agent-secret123", "runtime_target": "r"}
+        )
+        self.assertFalse(result.ok)
+
+    def test_call_tool_dispatch_live_mode(self):
+        out = call_tool(
+            "create_agent",
+            {"mode": "live", "purpose": "test", "runtime_target": "r"},
+        )
+        self.assertTrue(out["ok"])
+        self.assertEqual(out["mode"], "live")
+        self.assertTrue(out["candidate_refs"]["liveCreatePending"] == "true")
+
+    def test_call_tool_dispatch_default_dry_run(self):
+        out = call_tool(
+            "create_agent",
+            {"purpose": "test", "runtime_target": "r"},
+        )
+        self.assertEqual(out["mode"], "dry-run")
 
 
 if __name__ == "__main__":
