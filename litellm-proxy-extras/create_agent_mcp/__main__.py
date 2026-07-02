@@ -21,7 +21,7 @@ from __future__ import annotations
 
 import inspect
 import sys
-from typing import Any, Dict
+from typing import Any, Dict, Optional
 
 
 def _to_mcp_text(payload: Dict[str, Any]) -> str:
@@ -29,6 +29,32 @@ def _to_mcp_text(payload: Dict[str, Any]) -> str:
     import json
 
     return json.dumps(payload, sort_keys=True)
+
+
+def _enforce_strict_tool_args(
+    mcp: Any,
+    tool_name: str,
+    advertised_input_schema: Dict[str, Any],
+) -> None:
+    """Reject unknown MCP args instead of letting FastMCP drop them.
+
+    A hidden ``machine_id`` parameter lets raw callers get the tool's structured
+    fail-closed response with a request_id, while the advertised schema remains
+    the owner-facing Gateway contract from server.tool_schema().
+    """
+    from pydantic import ConfigDict
+
+    tool = mcp._tool_manager.get_tool(tool_name)  # type: ignore[attr-defined]
+    if tool is None:
+        raise RuntimeError(f"MCP tool not registered: {tool_name}")
+
+    arg_model = tool.fn_metadata.arg_model
+    arg_model.model_config = ConfigDict(
+        arbitrary_types_allowed=True,
+        extra="forbid",
+    )
+    arg_model.model_rebuild(force=True)
+    tool.parameters = advertised_input_schema
 
 
 def main() -> int:
@@ -48,19 +74,26 @@ def main() -> int:
         runtime_target: str,
         mode: str = "dry-run",
         allow_live_create: bool = False,
+        machine_id: Optional[str] = None,
     ) -> str:
         """Gateway-side create_agent. mode=dry-run (default) or mode=live (#907 gate)."""
+        tool_args = {
+            "purpose": purpose,
+            "runtime_target": runtime_target,
+            "mode": mode,
+            "allow_live_create": allow_live_create,
+        }
+        if machine_id is not None:
+            tool_args["machine_id"] = machine_id
+
         return _to_mcp_text(
             call_tool(
                 TOOL_NAME,
-                {
-                    "purpose": purpose,
-                    "runtime_target": runtime_target,
-                    "mode": mode,
-                    "allow_live_create": allow_live_create,
-                },
+                tool_args,
             )
         )
+
+    _enforce_strict_tool_args(mcp, TOOL_NAME, tool_schema()["inputSchema"])
 
     # Expose tool metadata so gateway registry readback is consistent.
     mcp._tool_schema = tool_schema  # type: ignore[attr-defined]
@@ -81,8 +114,9 @@ def create_agent_signature() -> inspect.Signature:
         runtime_target: str,
         mode: str = "dry-run",
         allow_live_create: bool = False,
+        machine_id: Optional[str] = None,
     ) -> str:
-        del purpose, runtime_target, mode, allow_live_create  # signature-only stub
+        del purpose, runtime_target, mode, allow_live_create, machine_id  # signature-only stub
         return ""
 
     return inspect.signature(_create_agent)
