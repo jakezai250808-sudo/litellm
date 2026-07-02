@@ -1,4 +1,4 @@
-"""create_agent_mcp package — Gateway-side create_agent MCP upstream (dry-run)."""
+"""create_agent_mcp package — Gateway-side create_agent MCP upstream."""
 
 from .server import (  # noqa: F401
     ACCESS_GROUP,
@@ -9,6 +9,7 @@ from .server import (  # noqa: F401
     CreateResult,
     call_tool,
     create_agent,
+    create_agent_live,
     list_tools,
     tool_schema,
     validate_create_intent,

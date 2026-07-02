@@ -181,6 +181,48 @@ def create_agent(args: Dict[str, Any]) -> CreateResult:
     )
 
 
+# ---------------------------------------------------------------------------
+# Live create path (B段 — requires owner GO + Runtime Placement gate #907)
+# ---------------------------------------------------------------------------
+def create_agent_live(args: Dict[str, Any]) -> CreateResult:
+    """Live create_agent with a structured liveCreateCard.
+
+    Validates the intent identically to the dry-run path (fail-closed on
+    missing required fields, unsafe machine_id, secret-shaped args), then
+    produces a liveCreateCard with the full create intent + request_id +
+    readback/rollback plans. The actual agent creation is executed by #907
+    under owner GO + Runtime Placement gate.
+
+    This function does NOT call the Raft/Runtime API itself — that call lives
+    in #907. It produces the structured card that #907 consumes.
+    """
+    request_id = _new_request_id()
+    ok, blocked_reason, candidate_refs = validate_create_intent(args)
+    if not ok:
+        return CreateResult(
+            ok=False, request_id=request_id, mode="live",
+            executed=False, no_change=True, blocked_reason=blocked_reason,
+            candidate_refs=candidate_refs,
+        )
+
+    purpose = str(args.get("purpose", "")).strip()
+    runtime_target = str(args.get("runtime_target", "")).strip()
+
+    return CreateResult(
+        ok=True, request_id=request_id, mode="live",
+        executed=False,  # executed by #907 (owner GO + Runtime Placement gate)
+        no_change=True,  # still no-apply until #907 executes
+        blocked_reason=None,
+        candidate_refs={
+            **candidate_refs,
+            "liveCreatePending": "true",
+            "executionRequires": "owner GO + Runtime Placement gate (#907)",
+            "purpose": purpose[:120],
+            "runtime_target": runtime_target,
+        },
+    )
+
+
 def tool_schema() -> Dict[str, Any]:
     """MCP tool definition exposed to the gateway registry.
 
@@ -192,15 +234,23 @@ def tool_schema() -> Dict[str, Any]:
     return {
         "name": TOOL_NAME,
         "description": (
-            "Gateway-side create_agent (dry-run only). Returns a plan + "
-            "request_id; performs no live create/bind/start. Live create "
-            "requires a separate owner GO + Runtime Placement gate."
+            "Gateway-side create_agent. Returns a plan + request_id. "
+            "mode=dry-run (default): no live create/bind/start. "
+            "mode=live: produces a liveCreateCard for execution under "
+            "owner GO + Runtime Placement gate (#907). Live card does "
+            "NOT execute the create itself."
         ),
         "inputSchema": {
             "type": "object",
             "properties": {
                 "purpose": {"type": "string", "description": "Short create intent / reason."},
                 "runtime_target": {"type": "string", "description": "Target runtime/service slug."},
+                "mode": {
+                    "type": "string",
+                    "enum": ["dry-run", "live"],
+                    "default": "dry-run",
+                    "description": "dry-run=plan only (default); live=produce liveCreateCard for #907 gate",
+                },
                 "allow_live_create": {
                     "type": "boolean",
                     "default": False,
@@ -229,4 +279,17 @@ def call_tool(name: str, arguments: Dict[str, Any]) -> Dict[str, Any]:
             blocked_reason=f"unknown tool: {name}",
             candidate_refs={},
         ).to_dict()
+    mode = arguments.get("mode", "dry-run")
+    if mode not in ("dry-run", "live"):
+        return CreateResult(
+            ok=False,
+            request_id=_new_request_id(),
+            mode=mode,
+            executed=False,
+            no_change=True,
+            blocked_reason=f"unknown mode: {mode!r} (valid: dry-run, live)",
+            candidate_refs={},
+        ).to_dict()
+    if mode == "live":
+        return create_agent_live(arguments).to_dict()
     return create_agent(arguments).to_dict()

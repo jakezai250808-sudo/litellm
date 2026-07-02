@@ -31,6 +31,7 @@ from create_agent_mcp import (  # noqa: E402
     TOOL_NAME,
     call_tool,
     create_agent,
+    create_agent_live,
     list_tools,
     tool_schema,
     validate_create_intent,
@@ -198,18 +199,20 @@ class TestEntrypoint(unittest.TestCase):
         # The gateway derives the public tool schema from the decorated
         # create_agent function signature (deploy contract). machine_id must NOT
         # be a parameter — machine placement is owned by the Runtime Placement
-        # gate (#907), not the caller.
+        # gate (#907), not the caller. mode= must be present with dry-run default.
         from create_agent_mcp import __main__
 
         sig = __main__.create_agent_signature()
         params = set(sig.parameters.keys())
-        self.assertEqual(params, {"purpose", "runtime_target", "allow_live_create"})
+        self.assertEqual(params, {"purpose", "runtime_target", "mode", "allow_live_create"})
         self.assertNotIn("machine_id", params)
         # required (no default) params are the public required fields
         required = {
             name for name, p in sig.parameters.items() if p.default is inspect.Parameter.empty
         }
         self.assertEqual(required, {"purpose", "runtime_target"})
+        # mode defaults to dry-run
+        self.assertEqual(sig.parameters["mode"].default, "dry-run")
 
 
 class TestRegistryIdentity(unittest.TestCase):
@@ -229,6 +232,63 @@ class TestRegistryIdentity(unittest.TestCase):
         self.assertEqual(data["access_group"], ACCESS_GROUP)
         self.assertEqual(data["allowed_tools"], [TOOL_NAME])
         self.assertFalse(data["allow_all_keys"])
+
+
+class TestLiveCreate(unittest.TestCase):
+    def test_live_create_returns_card_not_executed(self):
+        result = create_agent_live(
+            {"purpose": "onboard test agent", "runtime_target": "infra-agent"}
+        )
+        self.assertTrue(result.ok)
+        self.assertEqual(result.mode, "live")
+        self.assertFalse(result.executed)  # #907 executes, not this tool
+        self.assertTrue(result.no_change)
+        self.assertIsNone(result.blocked_reason)
+        self.assertIn("liveCreatePending", result.candidate_refs)
+        self.assertTrue(result.candidate_refs["liveCreatePending"] == "true")
+        self.assertIn("executionRequires", result.candidate_refs)
+
+    def test_live_create_invalid_rejected(self):
+        result = create_agent_live({"runtime_target": "r"})  # missing purpose
+        self.assertFalse(result.ok)
+        self.assertIn("purpose", result.blocked_reason)
+
+    def test_live_create_with_secret_rejected(self):
+        result = create_agent_live(
+            {"purpose": "sk-agent-secret123", "runtime_target": "r"}
+        )
+        self.assertFalse(result.ok)
+
+    def test_call_tool_dispatch_live_mode(self):
+        out = call_tool(
+            "create_agent",
+            {"mode": "live", "purpose": "test", "runtime_target": "r"},
+        )
+        self.assertTrue(out["ok"])
+        self.assertEqual(out["mode"], "live")
+        self.assertTrue(out["candidate_refs"]["liveCreatePending"] == "true")
+
+    def test_call_tool_dispatch_default_dry_run(self):
+        out = call_tool(
+            "create_agent",
+            {"purpose": "test", "runtime_target": "r"},
+        )
+        self.assertEqual(out["mode"], "dry-run")
+
+    def test_call_tool_unknown_mode_fail_closed(self):
+        out = call_tool(
+            "create_agent",
+            {"purpose": "test", "runtime_target": "r", "mode": "nonsense"},
+        )
+        self.assertFalse(out["ok"])
+        self.assertIn("unknown mode", out["blocked_reason"])
+
+    def test_tool_schema_has_mode_param(self):
+        schema = tool_schema()
+        props = schema["inputSchema"]["properties"]
+        self.assertIn("mode", props)
+        self.assertEqual(props["mode"]["enum"], ["dry-run", "live"])
+        self.assertEqual(props["mode"]["default"], "dry-run")
 
 
 if __name__ == "__main__":
