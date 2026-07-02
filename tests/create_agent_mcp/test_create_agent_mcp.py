@@ -50,10 +50,11 @@ class TestToolShape(unittest.TestCase):
         schema = tool_schema()
         self.assertEqual(schema["name"], TOOL_NAME)
         props = schema["inputSchema"]["properties"]
-        for field in ("purpose", "runtime_target", "allow_live_create"):
+        for field in ("purpose", "runtime_target", "mode", "allow_live_create"):
             self.assertIn(field, props)
         # machine_id must NOT be in the public schema
         self.assertNotIn("machine_id", props)
+        self.assertFalse(schema["inputSchema"]["additionalProperties"])
         self.assertEqual(
             set(schema["inputSchema"]["required"]),
             {"purpose", "runtime_target"},
@@ -195,17 +196,18 @@ class TestEntrypoint(unittest.TestCase):
         rc = __main__.main()
         self.assertEqual(rc, 2)
 
-    def test_decorated_tool_signature_has_no_machine_id(self):
-        # The gateway derives the public tool schema from the decorated
-        # create_agent function signature (deploy contract). machine_id must NOT
-        # be a parameter — machine placement is owned by the Runtime Placement
-        # gate (#907), not the caller. mode= must be present with dry-run default.
+    def test_decorated_tool_signature_has_hidden_machine_id(self):
+        # FastMCP otherwise drops unknown args before our fail-closed validator.
+        # Keep machine_id as a hidden optional runtime argument while advertising
+        # only server.tool_schema() to the Gateway.
         from create_agent_mcp import __main__
 
         sig = __main__.create_agent_signature()
         params = set(sig.parameters.keys())
-        self.assertEqual(params, {"purpose", "runtime_target", "mode", "allow_live_create"})
-        self.assertNotIn("machine_id", params)
+        self.assertEqual(
+            params,
+            {"purpose", "runtime_target", "mode", "allow_live_create", "machine_id"},
+        )
         # required (no default) params are the public required fields
         required = {
             name for name, p in sig.parameters.items() if p.default is inspect.Parameter.empty
@@ -213,6 +215,7 @@ class TestEntrypoint(unittest.TestCase):
         self.assertEqual(required, {"purpose", "runtime_target"})
         # mode defaults to dry-run
         self.assertEqual(sig.parameters["mode"].default, "dry-run")
+        self.assertIsNone(sig.parameters["machine_id"].default)
 
 
 class TestRegistryIdentity(unittest.TestCase):
