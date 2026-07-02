@@ -24,6 +24,7 @@ This module is import-safe (no side effects on import). Run as a process via
 from __future__ import annotations
 
 import json
+import os
 import re
 import secrets
 import uuid
@@ -35,6 +36,24 @@ SERVER_NAME = "create-agent-dryrun-local"
 ACCESS_GROUP = "agent-create-dryrun"
 TOOL_NAME = "create_agent"
 ALLOW_ALL_KEYS = False
+
+# ---------------------------------------------------------------------------
+# True-create executor config (checked at runtime, fail-closed if missing)
+# Set by the Gateway deployer via environment or SSM. Each field must be
+# explicitly configured before `create_agent_execute` will call the Raft API.
+# If any field is missing the executor returns `ok=false/no_change=true` with
+# a specific blocked_reason — it never guesses credentials or placement.
+# ---------------------------------------------------------------------------
+EXECUTOR_SERVER_ID = os.environ.get("CREATE_AGENT_EXECUTOR_SERVER_ID", "")
+EXECUTOR_MACHINE_ID = os.environ.get("CREATE_AGENT_EXECUTOR_MACHINE_ID", "")
+EXECUTOR_CONTROL_PLANE_TOKEN_REF = os.environ.get(
+    "CREATE_AGENT_EXECUTOR_CONTROL_PLANE_TOKEN_REF", ""
+)
+EXECUTOR_ENDPOINT = os.environ.get(
+    "CREATE_AGENT_EXECUTOR_ENDPOINT",
+    "https://api.raft.build/internal/agent-api/agents",
+)
+EXECUTOR_ENABLED = os.environ.get("CREATE_AGENT_EXECUTOR_ENABLED", "0") == "1"
 
 # Required fields for the public create_agent tool. Kept minimal and
 # owner-facing: the caller expresses intent (purpose + runtime_target) only.
@@ -152,6 +171,137 @@ def validate_create_intent(args: Dict[str, Any]) -> Tuple[bool, Optional[str], D
         "purpose": purpose[:120],
     }
     return True, None, candidate_refs
+
+
+def create_agent_execute(args: Dict[str, Any]) -> CreateResult:
+    """Imperative agent-create via Raft server API.
+
+    Calls POST /api/agents on the Raft server with a control-plane token (SSM
+    path ``/slock/raft-api-token`` as specified by PM).  Requires three config
+    preconditions — serverId, machineId, control-plane token — and an explicit
+    enable flag ``CREATE_AGENT_EXECUTOR_ENABLED=1``.  Any missing precondition
+    returns a fail-closed result (``ok=false, executed=false, no_change=true``)
+    with a specific ``blocked_reason``.  The executor never guesses credentials
+    or placement.
+
+    On success returns ``executed=true, no_change=false`` plus the server-side
+    agent-id, server-id, and a bind readiness reference.
+    """
+    req_id = _new_request_id()
+
+    # 1) Fail-closed: executor must be explicitly enabled.
+    if not EXECUTOR_ENABLED:
+        return CreateResult(
+            ok=False, request_id=req_id, mode="live",
+            executed=False, no_change=True,
+            blocked_reason="true-create executor not enabled (set CREATE_AGENT_EXECUTOR_ENABLED=1)",
+            candidate_refs={},
+        )
+
+    # 2) Validate create intent (same contract as dry-run).
+    ok, blocked, refs = validate_create_intent(args)
+    if not ok:
+        return CreateResult(
+            ok=False, request_id=req_id, mode="live",
+            executed=False, no_change=True, blocked_reason=blocked,
+            candidate_refs=refs,
+        )
+
+    # 3) Executor preconditions.
+    missing = []
+    if not EXECUTOR_SERVER_ID:
+        missing.append("CREATE_AGENT_EXECUTOR_SERVER_ID")
+    if not EXECUTOR_MACHINE_ID:
+        missing.append("CREATE_AGENT_EXECUTOR_MACHINE_ID")
+    if not EXECUTOR_CONTROL_PLANE_TOKEN_REF:
+        missing.append("CREATE_AGENT_EXECUTOR_CONTROL_PLANE_TOKEN_REF")
+    if missing:
+        return CreateResult(
+            ok=False, request_id=req_id, mode="live",
+            executed=False, no_change=True,
+            blocked_reason=f"true-create executor missing config: {', '.join(missing)}",
+            candidate_refs=refs,
+        )
+
+    # 4) Resolve the control-plane token from SSM.
+    import subprocess as _sp
+    token = ""
+    try:
+        raw = _sp.check_output(
+            ["aws", "ssm", "get-parameter", "--name", EXECUTOR_CONTROL_PLANE_TOKEN_REF,
+             "--with-decryption", "--region", os.environ.get("AWS_REGION", "us-west-2"),
+             "--query", "Parameter.Value", "--output", "text"],
+            stderr=_sp.DEVNULL,
+            timeout=10,
+        )
+        token = raw.decode("utf-8").strip()
+    except Exception:
+        return CreateResult(
+            ok=False, request_id=req_id, mode="live",
+            executed=False, no_change=True,
+            blocked_reason="true-create executor: cannot resolve control-plane token from SSM",
+            candidate_refs=refs,
+        )
+
+    if not token:
+        return CreateResult(
+            ok=False, request_id=req_id, mode="live",
+            executed=False, no_change=True,
+            blocked_reason="true-create executor: resolved token is empty",
+            candidate_refs=refs,
+        )
+
+    # 5) Build the request body and call POST /api/agents.
+    purpose = str(args.get("purpose", "")).strip()
+    runtime_target = str(args.get("runtime_target", "")).strip()
+    agent_name = f"{EXECUTOR_SERVER_ID}-{runtime_target}-{req_id[-8:]}"
+    body = {
+        "name": agent_name,
+        "displayName": args.get("display_name", purpose[:80]),
+        "description": purpose[:500],
+        "model": args.get("model", os.environ.get("WORKER_MODEL", "auto-cheap")),
+        "runtime": args.get("runtime", os.environ.get("AGENT_RUNTIME_CLIENT", "claude-code")),
+        "server": EXECUTOR_SERVER_ID,
+        "machineId": EXECUTOR_MACHINE_ID,
+    }
+
+    try:
+        import urllib.request as _ur
+        data = json.dumps(body).encode("utf-8")
+        req = _ur.Request(
+            EXECUTOR_ENDPOINT,
+            data=data,
+            headers={
+                "Authorization": f"Bearer {token}",
+                "Content-Type": "application/json",
+                "X-Server-Id": EXECUTOR_SERVER_ID,
+            },
+            method="POST",
+        )
+        with _ur.urlopen(req, timeout=30) as resp:
+            resp_data = json.loads(resp.read().decode("utf-8"))
+    except Exception as exc:
+        return CreateResult(
+            ok=False, request_id=req_id, mode="live",
+            executed=False, no_change=True,
+            blocked_reason=f"true-create executor API call failed: {type(exc).__name__}",
+            candidate_refs=refs,
+        )
+
+    # 6) Build success result.
+    return CreateResult(
+        ok=True, request_id=req_id, mode="live",
+        executed=True, no_change=False, blocked_reason=None,
+        candidate_refs={
+            **refs,
+            "purpose": purpose[:120],
+            "runtime_target": runtime_target,
+            "agentId": resp_data.get("id", ""),
+            "serverId": EXECUTOR_SERVER_ID,
+            "machineId": EXECUTOR_MACHINE_ID,
+            "bindReadiness": "pending",  # verified in a follow-up readback, not here
+        },
+    )
 
 
 def create_agent(args: Dict[str, Any]) -> CreateResult:
@@ -291,5 +441,7 @@ def call_tool(name: str, arguments: Dict[str, Any]) -> Dict[str, Any]:
             candidate_refs={},
         ).to_dict()
     if mode == "live":
+        if EXECUTOR_ENABLED:
+            return create_agent_execute(arguments).to_dict()
         return create_agent_live(arguments).to_dict()
     return create_agent(arguments).to_dict()
