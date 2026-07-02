@@ -1,0 +1,84 @@
+name: Migration dry-run
+on:
+  workflow_dispatch:
+    inputs:
+      build_migration_dry_run:
+        description: "Run migration dry-run (compose + Postgres + version check)"
+        type: boolean
+        default: true
+  pull_request:
+    paths:
+      - "migrations/**"
+      - "litellm-proxy-extras/migration_dry_run.*"
+      - ".github/workflows/migration-dry-run.yml"
+      - "docker-compose.yml"
+      - "schema.prisma"
+
+permissions:
+  contents: read
+
+jobs:
+  migration-dry-run:
+    if: ${{ github.event_name != 'workflow_dispatch' || inputs.build_migration_dry_run }}
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_USER: llmproxy
+          POSTGRES_PASSWORD: dbpassword9090
+          POSTGRES_DB: litellm
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+        ports:
+          - 5432:5432
+    env:
+      DATABASE_URL: postgresql://llmproxy:dbpassword9090@localhost:5432/litellm
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install LiteLLM deps
+        shell: bash
+        run: |
+          set -euo pipefail
+          python -m pip install --upgrade pip
+          pip install -e ".[proxy]"
+
+      - name: Migration dry-run (version + schema diff)
+        id: migration
+        shell: bash
+        run: |
+          set -euo pipefail
+          bash litellm-proxy-extras/migration_dry_run.sh dry-run \
+            --mode both \
+            --output "${{ runner.temp }}/migration-report.json"
+
+      - name: Show migration report
+        if: always()
+        shell: bash
+        run: |
+          set -euo pipefail
+          report="${{ runner.temp }}/migration-report.json"
+          if [ -f "$report" ]; then
+            python3 -m json.tool "$report"
+            echo "::group::Migration-Report"
+            cat "$report"
+            echo "::endgroup::"
+          else
+            echo "no migration report found"
+          fi
+
+      - name: Collect dry-run artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: migration-dry-run-report
+          path: "${{ runner.temp }}/migration-report.json"
