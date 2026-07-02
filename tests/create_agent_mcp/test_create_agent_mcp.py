@@ -27,10 +27,12 @@ sys.path.insert(0, PKG_ROOT)
 from create_agent_mcp import (  # noqa: E402
     ACCESS_GROUP,
     ALLOW_ALL_KEYS,
+    EXECUTOR_ENABLED,
     SERVER_NAME,
     TOOL_NAME,
     call_tool,
     create_agent,
+    create_agent_execute,
     create_agent_live,
     list_tools,
     tool_schema,
@@ -289,6 +291,68 @@ class TestLiveCreate(unittest.TestCase):
         self.assertIn("mode", props)
         self.assertEqual(props["mode"]["enum"], ["dry-run", "live"])
         self.assertEqual(props["mode"]["default"], "dry-run")
+
+
+class TestExecuteFailClosed(unittest.TestCase):
+    def test_not_enabled_rejected(self):
+        self.assertFalse(EXECUTOR_ENABLED, "EXECUTOR_ENABLED must default to 0")
+        result = create_agent_execute(
+            {"purpose": "test", "runtime_target": "r"}
+        )
+        self.assertFalse(result.ok)
+        self.assertFalse(result.executed)
+        self.assertTrue(result.no_change)
+        self.assertIn("not enabled", result.blocked_reason)
+
+    def test_missing_config_rejected(self):
+        # Simulate: executor enabled but config env vars empty
+        import create_agent_mcp.server as svr
+        orig_server = svr.EXECUTOR_SERVER_ID
+        orig_machine = svr.EXECUTOR_MACHINE_ID
+        orig_token = svr.EXECUTOR_CONTROL_PLANE_TOKEN_REF
+        orig_enabled = svr.EXECUTOR_ENABLED
+        try:
+            svr.EXECUTOR_ENABLED = True
+            svr.EXECUTOR_SERVER_ID = ""
+            svr.EXECUTOR_MACHINE_ID = ""
+            svr.EXECUTOR_CONTROL_PLANE_TOKEN_REF = ""
+            result = create_agent_execute(
+                {"purpose": "test", "runtime_target": "r"}
+            )
+            self.assertFalse(result.ok)
+            self.assertFalse(result.executed)
+            self.assertIn("missing config", result.blocked_reason)
+            self.assertIn("SERVER_ID", result.blocked_reason)
+        finally:
+            svr.EXECUTOR_SERVER_ID = orig_server
+            svr.EXECUTOR_MACHINE_ID = orig_machine
+            svr.EXECUTOR_CONTROL_PLANE_TOKEN_REF = orig_token
+            svr.EXECUTOR_ENABLED = orig_enabled
+
+    def test_invalid_intent_rejected(self):
+        # Executor reuses validate_create_intent — secret shapes still blocked
+        import create_agent_mcp.server as svr
+        orig_enabled = svr.EXECUTOR_ENABLED
+        orig_server = svr.EXECUTOR_SERVER_ID
+        try:
+            svr.EXECUTOR_ENABLED = True
+            svr.EXECUTOR_SERVER_ID = "srv-test"
+            result = create_agent_execute(
+                {"purpose": "sk-ant-secret999", "runtime_target": "r"}
+            )
+            self.assertFalse(result.ok)
+            self.assertIn("secret", result.blocked_reason)
+        finally:
+            svr.EXECUTOR_ENABLED = orig_enabled
+            svr.EXECUTOR_SERVER_ID = orig_server
+
+    def test_call_tool_live_without_enable_returns_card(self):
+        # When EXECUTOR_ENABLED=0, mode=live still returns liveCreateCard
+        out = call_tool("create_agent", {"mode": "live", "purpose": "p", "runtime_target": "r"})
+        self.assertTrue(out["ok"])
+        self.assertEqual(out["mode"], "live")
+        self.assertEqual(out["executed"], False)
+        self.assertTrue(out["candidate_refs"]["liveCreatePending"] == "true")
 
 
 if __name__ == "__main__":
