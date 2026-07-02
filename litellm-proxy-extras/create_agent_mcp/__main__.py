@@ -31,6 +31,23 @@ def _to_mcp_text(payload: Dict[str, Any]) -> str:
     return json.dumps(payload, sort_keys=True)
 
 
+def _enforce_no_extra_args_schema(mcp: Any, tool_name: str) -> None:
+    """Make FastMCP advertise strict args for the registered tool.
+
+    FastMCP derives the schema from the decorated Python signature. Older SDK
+    versions omit ``additionalProperties: false`` even for fixed signatures,
+    which lets the Gateway REST bridge miss unknown caller args before FastMCP
+    silently drops them. The tool manager serializes ``Tool.parameters`` during
+    ``tools/list``, so set the contract there immediately after registration.
+    """
+    tool_manager = getattr(mcp, "_tool_manager", None)
+    tools = getattr(tool_manager, "_tools", {}) if tool_manager is not None else {}
+    tool = tools.get(tool_name) if isinstance(tools, dict) else None
+    parameters = getattr(tool, "parameters", None)
+    if isinstance(parameters, dict):
+        parameters["additionalProperties"] = False
+
+
 def main() -> int:
     try:
         from mcp.server.fastmcp import FastMCP
@@ -61,6 +78,8 @@ def main() -> int:
                 },
             )
         )
+
+    _enforce_no_extra_args_schema(mcp, TOOL_NAME)
 
     # Expose tool metadata so gateway registry readback is consistent.
     mcp._tool_schema = tool_schema  # type: ignore[attr-defined]

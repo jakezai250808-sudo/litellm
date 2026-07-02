@@ -1013,6 +1013,16 @@ class TestCallToolRestAPI:
             captured.update(kwargs)
             return {"result": "ok"}
 
+        async def fake_get_tools_for_single_server(*args, **kwargs):
+            tool = MagicMock()
+            tool.name = "demo-tool"
+            tool.inputSchema = {
+                "type": "object",
+                "properties": {"foo": {"type": "string"}},
+                "additionalProperties": False,
+            }
+            return [tool]
+
         monkeypatch.setattr(
             rest_endpoints,
             "build_effective_auth_contexts",
@@ -1047,6 +1057,12 @@ class TestCallToolRestAPI:
             fake_execute_mcp_tool,
             raising=False,
         )
+        monkeypatch.setattr(
+            rest_endpoints,
+            "_get_tools_for_single_server",
+            fake_get_tools_for_single_server,
+            raising=False,
+        )
 
         request_payload = {
             "server_id": "server-1",
@@ -1068,6 +1084,113 @@ class TestCallToolRestAPI:
         assert captured["name"] == "demo-tool"
         assert captured["arguments"] == {"foo": "bar"}
         assert captured["allowed_mcp_servers"] == [stub_server]
+
+    async def test_rejects_unknown_arguments_before_execute(self, monkeypatch):
+        async def fake_contexts(user_api_key_auth):
+            return [user_api_key_auth]
+
+        async def fake_get_allowed_mcp_servers(*args, **kwargs):
+            return ["server-1"]
+
+        class StubServer:
+            server_id = "server-1"
+            alias = "server-1"
+            server_name = "server-1"
+            name = "stub"
+            allowed_tools = None
+            mcp_info = {"server_name": "stub"}
+            available_on_public_internet = True
+            auth_type = None
+
+        stub_server = StubServer()
+
+        async def fake_add_litellm_data_to_request(**kwargs):
+            return kwargs.get("data", {})
+
+        async def fake_get_tools_for_single_server(*args, **kwargs):
+            tool = MagicMock()
+            tool.name = "create_agent"
+            tool.inputSchema = {
+                "type": "object",
+                "properties": {
+                    "purpose": {"type": "string"},
+                    "runtime_target": {"type": "string"},
+                    "mode": {"type": "string"},
+                    "allow_live_create": {"type": "boolean"},
+                },
+                "additionalProperties": False,
+            }
+            return [tool]
+
+        async def fake_execute_mcp_tool(**kwargs):  # pragma: no cover - should not run
+            raise AssertionError("execute_mcp_tool must not run for unknown args")
+
+        monkeypatch.setattr(
+            rest_endpoints,
+            "build_effective_auth_contexts",
+            fake_contexts,
+            raising=False,
+        )
+        monkeypatch.setattr(
+            rest_endpoints.global_mcp_server_manager,
+            "get_allowed_mcp_servers",
+            fake_get_allowed_mcp_servers,
+            raising=False,
+        )
+        monkeypatch.setattr(
+            rest_endpoints.global_mcp_server_manager,
+            "get_mcp_server_by_id",
+            lambda server_id: stub_server if server_id == "server-1" else None,
+            raising=False,
+        )
+        monkeypatch.setattr(
+            "litellm.proxy.proxy_server.add_litellm_data_to_request",
+            fake_add_litellm_data_to_request,
+            raising=False,
+        )
+        monkeypatch.setattr(
+            "litellm.proxy.proxy_server.proxy_config",
+            {},
+            raising=False,
+        )
+        monkeypatch.setattr(
+            rest_endpoints,
+            "_get_tools_for_single_server",
+            fake_get_tools_for_single_server,
+            raising=False,
+        )
+        monkeypatch.setattr(
+            rest_endpoints,
+            "execute_mcp_tool",
+            fake_execute_mcp_tool,
+            raising=False,
+        )
+
+        request_payload = {
+            "server_id": "server-1",
+            "name": "create_agent",
+            "arguments": {
+                "mode": "live",
+                "purpose": "test",
+                "runtime_target": "r",
+                "machine_id": "should-not-pass",
+            },
+        }
+        request = _build_request(
+            path="/mcp-rest/tools/call",
+            method="POST",
+            json_body=request_payload,
+        )
+
+        with pytest.raises(HTTPException) as exc_info:
+            await rest_endpoints.call_tool_rest_api(
+                request,
+                user_api_key_dict=UserAPIKeyAuth(),
+            )
+
+        assert exc_info.value.status_code == 400
+        assert exc_info.value.detail["error"] == "unknown_tool_arguments"
+        assert exc_info.value.detail["unknown_arguments"] == ["machine_id"]
 
 
 class TestGetToolsForSingleServer:
