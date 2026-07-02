@@ -40,7 +40,10 @@ from create_agent_mcp import (  # noqa: E402
 )
 from create_agent_mcp.server import (  # noqa: E402
     CreateResult,
+    _build_executor_agent_body,
     _deep_secret_scan,
+    _extract_bearer_token,
+    _normalize_agent_runtime,
 )
 
 
@@ -56,6 +59,7 @@ class TestToolShape(unittest.TestCase):
             self.assertIn(field, props)
         # machine_id must NOT be in the public schema
         self.assertNotIn("machine_id", props)
+        self.assertIs(schema["inputSchema"]["additionalProperties"], False)
         self.assertEqual(
             set(schema["inputSchema"]["required"]),
             {"purpose", "runtime_target"},
@@ -113,6 +117,12 @@ class TestFailClosed(unittest.TestCase):
         self._expect_blocked(
             {"purpose": "p", "runtime_target": "r", "machine_id": "ip-172-31-58-63"},
             "machine_id",
+        )
+
+    def test_unknown_arg_rejected(self):
+        self._expect_blocked(
+            {"purpose": "p", "runtime_target": "r", "unexpected": "value"},
+            "unknown argument",
         )
 
     def test_allow_live_create_bool_rejected(self):
@@ -216,6 +226,25 @@ class TestEntrypoint(unittest.TestCase):
         # mode defaults to dry-run
         self.assertEqual(sig.parameters["mode"].default, "dry-run")
 
+    def test_fastmcp_registered_tool_schema_rejects_extra_args(self):
+        from create_agent_mcp import __main__
+
+        class Tool:
+            parameters = {"type": "object", "properties": {"purpose": {"type": "string"}}}
+
+        class ToolManager:
+            _tools = {"create_agent": Tool()}
+
+        class FakeMCP:
+            _tool_manager = ToolManager()
+
+        __main__._enforce_no_extra_args_schema(FakeMCP(), "create_agent")
+
+        self.assertIs(
+            FakeMCP._tool_manager._tools["create_agent"].parameters["additionalProperties"],
+            False,
+        )
+
 
 class TestRegistryIdentity(unittest.TestCase):
     def test_constants_match_registry_yaml(self):
@@ -294,6 +323,31 @@ class TestLiveCreate(unittest.TestCase):
 
 
 class TestExecuteFailClosed(unittest.TestCase):
+    def test_extract_bearer_token_from_json_ssm_value(self):
+        raw = json.dumps({"accessToken": "access-123", "refreshToken": "refresh-123"})
+        self.assertEqual(_extract_bearer_token(raw), "access-123")
+        self.assertEqual(_extract_bearer_token("raw-token"), "raw-token")
+
+    def test_executor_agent_body_matches_control_plane_shape(self):
+        body = _build_executor_agent_body(
+            args={"purpose": "test purpose", "runtime_target": "mcp968pos", "runtime": "claude-code"},
+            request_id="req-1234567890abcdef",
+            server_id="server-1",
+            machine_id="machine-1",
+        )
+
+        self.assertEqual(body["serverId"], "server-1")
+        self.assertEqual(body["machineId"], "machine-1")
+        self.assertEqual(body["executionMode"], "byoc")
+        self.assertEqual(body["runtime"], "claude")
+        self.assertNotIn("server", body)
+        self.assertIn("runtimeConfig", body)
+
+    def test_normalize_agent_runtime_aliases(self):
+        self.assertEqual(_normalize_agent_runtime("claude-code"), "claude")
+        self.assertEqual(_normalize_agent_runtime("cc"), "claude")
+        self.assertEqual(_normalize_agent_runtime("codex"), "codex")
+
     def test_not_enabled_rejected(self):
         self.assertFalse(EXECUTOR_ENABLED, "EXECUTOR_ENABLED must default to 0")
         result = create_agent_execute(

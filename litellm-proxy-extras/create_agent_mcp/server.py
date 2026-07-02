@@ -61,6 +61,7 @@ EXECUTOR_ENABLED = os.environ.get("CREATE_AGENT_EXECUTOR_ENABLED", "0") == "1"
 # boundary — it belongs to the Runtime Placement gate (task #907) under owner GO.
 # A caller-supplied machine_id is rejected (see validate_create_intent).
 PUBLIC_REQUIRED_FIELDS = ("purpose", "runtime_target")
+PUBLIC_ALLOWED_FIELDS = (*PUBLIC_REQUIRED_FIELDS, "mode", "allow_live_create")
 
 # Fail-closed: this phase NEVER performs live create, even if the caller asks.
 LIVE_CREATE_DISABLED = True
@@ -131,6 +132,71 @@ def _redact_secret_key(key: str) -> str:
     return f"<redacted:key:{key}>"
 
 
+def _extract_bearer_token(raw_token_value: str) -> str:
+    """Return an access token from either a raw-token or JSON-token SSM value."""
+    value = raw_token_value.strip()
+    if not value:
+        return ""
+    if value.startswith("{"):
+        try:
+            parsed = json.loads(value)
+        except json.JSONDecodeError:
+            return value
+        if isinstance(parsed, dict) and isinstance(parsed.get("accessToken"), str):
+            return parsed["accessToken"].strip()
+    return value
+
+
+def _normalize_agent_runtime(runtime: str) -> str:
+    runtime = runtime.strip()
+    if runtime in ("claude", "claude-code", "cc"):
+        return "claude"
+    if runtime == "codex":
+        return "codex"
+    return runtime
+
+
+def _build_executor_agent_body(
+    *,
+    args: Dict[str, Any],
+    request_id: str,
+    server_id: str,
+    machine_id: str,
+) -> Dict[str, Any]:
+    purpose = str(args.get("purpose", "")).strip()
+    runtime_target = str(args.get("runtime_target", "")).strip()
+    # Raft agent names are capped at 32 chars; keep executor-generated names short.
+    safe_target = "".join(
+        ch if ch.isalnum() else "-" for ch in runtime_target.lower()
+    ).strip("-") or "rt"
+    agent_name = f"gw939-{safe_target[:10]}-{request_id[-8:]}"[:32]
+    model = str(args.get("model", os.environ.get("WORKER_MODEL", "auto-cheap")))
+    runtime = _normalize_agent_runtime(
+        str(args.get("runtime", os.environ.get("AGENT_RUNTIME_CLIENT", "claude-code")))
+    )
+    body: Dict[str, Any] = {
+        "name": agent_name,
+        "displayName": args.get("display_name", purpose[:80] or agent_name),
+        "description": purpose[:500],
+        "model": model,
+        "runtime": runtime,
+        "serverId": server_id,
+        "machineId": machine_id,
+        "executionMode": "byoc",
+    }
+    if runtime == "claude":
+        body["runtimeConfig"] = {
+            "version": 1,
+            "runtime": runtime,
+            "provider": {"kind": "default"},
+            "model": {"kind": "preset", "id": model},
+            "mode": {"kind": "fast"},
+            "reasoningEffort": None,
+            "envVars": {},
+        }
+    return body
+
+
 def validate_create_intent(args: Dict[str, Any]) -> Tuple[bool, Optional[str], Dict[str, str]]:
     """Validate a create_agent tool-call argument dict.
 
@@ -146,6 +212,10 @@ def validate_create_intent(args: Dict[str, Any]) -> Tuple[bool, Optional[str], D
     # Deep secret scan — never accept secret-shaped tool args.
     if _deep_secret_scan(args):
         return False, "args contain secret-shaped value(s)", {}
+
+    unknown_fields = sorted(set(args.keys()) - set(PUBLIC_ALLOWED_FIELDS))
+    if unknown_fields:
+        return False, f"unknown argument(s): {', '.join(unknown_fields)}", {}
 
     # Required public fields presence + non-empty.
     for field in PUBLIC_REQUIRED_FIELDS:
@@ -234,7 +304,7 @@ def create_agent_execute(args: Dict[str, Any]) -> CreateResult:
             stderr=_sp.DEVNULL,
             timeout=10,
         )
-        token = raw.decode("utf-8").strip()
+        token = _extract_bearer_token(raw.decode("utf-8"))
     except Exception:
         return CreateResult(
             ok=False, request_id=req_id, mode="live",
@@ -254,16 +324,12 @@ def create_agent_execute(args: Dict[str, Any]) -> CreateResult:
     # 5) Build the request body and call POST /api/agents.
     purpose = str(args.get("purpose", "")).strip()
     runtime_target = str(args.get("runtime_target", "")).strip()
-    agent_name = f"{EXECUTOR_SERVER_ID}-{runtime_target}-{req_id[-8:]}"
-    body = {
-        "name": agent_name,
-        "displayName": args.get("display_name", purpose[:80]),
-        "description": purpose[:500],
-        "model": args.get("model", os.environ.get("WORKER_MODEL", "auto-cheap")),
-        "runtime": args.get("runtime", os.environ.get("AGENT_RUNTIME_CLIENT", "claude-code")),
-        "server": EXECUTOR_SERVER_ID,
-        "machineId": EXECUTOR_MACHINE_ID,
-    }
+    body = _build_executor_agent_body(
+        args=args,
+        request_id=req_id,
+        server_id=EXECUTOR_SERVER_ID,
+        machine_id=EXECUTOR_MACHINE_ID,
+    )
 
     try:
         import urllib.request as _ur
@@ -274,6 +340,8 @@ def create_agent_execute(args: Dict[str, Any]) -> CreateResult:
             headers={
                 "Authorization": f"Bearer {token}",
                 "Content-Type": "application/json",
+                "Accept": "application/json",
+                "User-Agent": "node",
                 "X-Server-Id": EXECUTOR_SERVER_ID,
             },
             method="POST",
@@ -408,6 +476,7 @@ def tool_schema() -> Dict[str, Any]:
                 },
             },
             "required": ["purpose", "runtime_target"],
+            "additionalProperties": False,
         },
     }
 

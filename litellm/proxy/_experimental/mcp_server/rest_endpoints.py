@@ -438,6 +438,82 @@ if MCP_AVAILABLE:
 
         return _create_tool_response_objects(tools, server.mcp_info)
 
+    def _input_schema_disallows_unknown_args(input_schema: Any) -> bool:
+        return isinstance(input_schema, dict) and input_schema.get(
+            "additionalProperties"
+        ) is False
+
+    def _input_schema_property_names(input_schema: Any) -> Set[str]:
+        if not isinstance(input_schema, dict):
+            return set()
+        properties = input_schema.get("properties") or {}
+        if not isinstance(properties, dict):
+            return set()
+        return set(str(name) for name in properties.keys())
+
+    def _validate_tool_arguments_against_input_schema(
+        *,
+        tool_name: str,
+        tool_arguments: Dict[str, Any],
+        input_schema: Any,
+    ) -> None:
+        """Reject unknown REST tool args before MCP client normalization.
+
+        Some MCP SDKs call strict function signatures after silently dropping
+        undeclared arguments. If a tool advertises ``additionalProperties:
+        false``, enforce that contract at the REST bridge so fail-closed tools
+        see unsafe caller input before any create/side effect can happen.
+        """
+        if not _input_schema_disallows_unknown_args(input_schema):
+            return
+        allowed = _input_schema_property_names(input_schema)
+        unknown = sorted(set(str(name) for name in tool_arguments.keys()) - allowed)
+        if unknown:
+            raise HTTPException(
+                status_code=400,
+                detail={
+                    "error": "unknown_tool_arguments",
+                    "message": (
+                        f"Tool '{tool_name}' does not accept argument(s): "
+                        f"{', '.join(unknown)}"
+                    ),
+                    "unknown_arguments": unknown,
+                },
+            )
+
+    async def _validate_rest_tool_arguments_before_call(
+        *,
+        tool_name: str,
+        tool_arguments: Dict[str, Any],
+        target_server,
+        server_auth_header,
+        raw_headers_from_request: Optional[Dict[str, str]],
+        user_api_key_dict: UserAPIKeyAuth,
+        user_oauth_extra_headers: Optional[Dict[str, str]],
+    ) -> None:
+        tools = await _get_tools_for_single_server(
+            target_server,
+            server_auth_header,
+            raw_headers_from_request,
+            user_api_key_dict,
+            extra_headers=user_oauth_extra_headers,
+        )
+        target_tool = next(
+            (
+                tool
+                for tool in tools
+                if _tool_name_matches(tool_name, [getattr(tool, "name", "")])
+            ),
+            None,
+        )
+        if target_tool is None:
+            return
+        _validate_tool_arguments_against_input_schema(
+            tool_name=tool_name,
+            tool_arguments=tool_arguments,
+            input_schema=getattr(target_tool, "inputSchema", None),
+        )
+
     async def _resolve_allowed_mcp_servers_for_tool_call(
         user_api_key_dict: UserAPIKeyAuth,
         server_id: str,
@@ -804,6 +880,14 @@ if MCP_AVAILABLE:
                 )
 
             tool_arguments = data.get("arguments") or {}
+            if not isinstance(tool_arguments, dict):
+                raise HTTPException(
+                    status_code=400,
+                    detail={
+                        "error": "invalid_arguments",
+                        "message": "arguments must be a JSON object",
+                    },
+                )
 
             proxy_base_llm_response_processor = ProxyBaseLLMRequestProcessing(data=data)
             (
@@ -852,6 +936,18 @@ if MCP_AVAILABLE:
             if target_server is not None:
                 user_oauth_extra_headers = await _get_user_oauth_extra_headers(
                     target_server, user_api_key_dict
+                )
+                server_auth_header = _get_server_auth_header(
+                    target_server, mcp_server_auth_headers, mcp_auth_header
+                )
+                await _validate_rest_tool_arguments_before_call(
+                    tool_name=tool_name,
+                    tool_arguments=tool_arguments,
+                    target_server=target_server,
+                    server_auth_header=server_auth_header,
+                    raw_headers_from_request=raw_headers_from_request,
+                    user_api_key_dict=user_api_key_dict,
+                    user_oauth_extra_headers=user_oauth_extra_headers,
                 )
 
             # Call execute_mcp_tool directly (permission checks already done)
